@@ -4,6 +4,20 @@ import json
 from pymongosql.sql.parser import SQLParser
 
 
+def group_of(pipeline):
+    """The $group stage; an aggregate without GROUP BY wraps it in $facet (one row even for no input)."""
+    for stage in pipeline:
+        if "$group" in stage:
+            return stage["$group"]
+        if "$facet" in stage:
+            return stage["$facet"]["row"][0]["$group"]
+    raise AssertionError("no $group stage")
+
+
+def project_of(pipeline):
+    return next(stage["$project"] for stage in pipeline if "$project" in stage and "row" not in stage["$project"])
+
+
 class TestCountStarParsing:
     """Test that COUNT(*) in SQL is translated to a MongoDB aggregate pipeline."""
 
@@ -17,11 +31,16 @@ class TestCountStarParsing:
         assert plan.collection == "users"
 
         pipeline = json.loads(plan.aggregate_pipeline)
-        # Should have $group and $project stages
-        assert len(pipeline) == 2
-        assert "$group" in pipeline[0]
-        assert pipeline[0]["$group"]["_id"] is None
-        assert pipeline[0]["$group"]["COUNT(*)"] == {"$sum": 1}
+        # $facet($group), the empty-input substitution, then $project
+        assert [next(iter(stage)) for stage in pipeline] == [
+            "$facet",
+            "$project",
+            "$unwind",
+            "$replaceRoot",
+            "$project",
+        ]
+        assert group_of(pipeline)["_id"] is None
+        assert group_of(pipeline)["COUNT(*)"] == {"$sum": 1}
 
     def test_count_star_with_alias(self):
         """SELECT COUNT(*) AS total FROM users → alias used in $group"""
@@ -31,10 +50,10 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert pipeline[0]["$group"]["total"] == {"$sum": 1}
+        assert group_of(pipeline)["total"] == {"$sum": 1}
         # $project should expose the alias
-        assert pipeline[1]["$project"]["total"] == 1
-        assert pipeline[1]["$project"]["_id"] == 0
+        assert project_of(pipeline)["total"] == 1
+        assert project_of(pipeline)["_id"] == 0
 
     def test_count_star_with_alias_no_as(self):
         """SELECT COUNT(*) total FROM users → alias without AS keyword"""
@@ -44,7 +63,7 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert pipeline[0]["$group"]["total"] == {"$sum": 1}
+        assert group_of(pipeline)["total"] == {"$sum": 1}
 
     def test_count_star_with_where(self):
         """SELECT COUNT(*) AS total FROM users WHERE age > 25 → $match before $group"""
@@ -54,11 +73,10 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        # Should have $match, $group, $project
-        assert len(pipeline) == 3
+        # $match first, then the grouping
         assert "$match" in pipeline[0]
-        assert "$group" in pipeline[1]
-        assert pipeline[1]["$group"]["total"] == {"$sum": 1}
+        assert "$facet" in pipeline[1]
+        assert group_of(pipeline)["total"] == {"$sum": 1}
 
     def test_count_star_projection_stage(self):
         """Projection stage should reflect aggregate output fields."""
@@ -83,7 +101,7 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert pipeline[0]["$group"]["total_price"] == {"$sum": "$price"}
+        assert group_of(pipeline)["total_price"] == {"$sum": "$price"}
 
     def test_avg(self):
         """SELECT AVG(age) AS avg_age FROM users"""
@@ -93,7 +111,7 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert pipeline[0]["$group"]["avg_age"] == {"$avg": "$age"}
+        assert group_of(pipeline)["avg_age"] == {"$avg": "$age"}
 
     def test_min(self):
         """SELECT MIN(price) AS cheapest FROM products"""
@@ -103,7 +121,7 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert pipeline[0]["$group"]["cheapest"] == {"$min": "$price"}
+        assert group_of(pipeline)["cheapest"] == {"$min": "$price"}
 
     def test_max(self):
         """SELECT MAX(price) AS most_expensive FROM products"""
@@ -113,7 +131,7 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert pipeline[0]["$group"]["most_expensive"] == {"$max": "$price"}
+        assert group_of(pipeline)["most_expensive"] == {"$max": "$price"}
 
     def test_multiple_aggregates(self):
         """SELECT COUNT(*) AS cnt, AVG(price) AS avg_price, MAX(price) AS max_price FROM products"""
@@ -123,13 +141,13 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        group = pipeline[0]["$group"]
+        group = group_of(pipeline)
         assert group["_id"] is None
         assert group["cnt"] == {"$sum": 1}
         assert group["avg_price"] == {"$avg": "$price"}
         assert group["max_price"] == {"$max": "$price"}
         # $project exposes all three
-        project = pipeline[1]["$project"]
+        project = project_of(pipeline)
         assert project == {"_id": 0, "cnt": 1, "avg_price": 1, "max_price": 1}
 
     def test_aggregate_with_nested_field(self):
@@ -140,7 +158,7 @@ class TestCountStarParsing:
 
         assert plan.is_aggregate_query is True
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert pipeline[0]["$group"]["revenue"] == {"$sum": "$details.total"}
+        assert group_of(pipeline)["revenue"] == {"$sum": "$details.total"}
 
     def test_aggregate_no_alias_uses_raw_text(self):
         """SELECT SUM(price) FROM products → alias defaults to SUM(price)"""
@@ -149,7 +167,7 @@ class TestCountStarParsing:
         plan = parser.get_execution_plan()
 
         pipeline = json.loads(plan.aggregate_pipeline)
-        assert "SUM(price)" in pipeline[0]["$group"]
+        assert "SUM(price)" in group_of(pipeline)
 
     def test_regular_select_unaffected(self):
         """Regular SELECT without aggregate functions should not be affected."""

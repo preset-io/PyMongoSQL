@@ -241,13 +241,21 @@ class ExecutionPlanBuilder:
         return builder.build()
 
     @staticmethod
-    def _aggregate_source(func_info: Dict[str, Any], key: str) -> Any:
-        """$project expression for an accumulator: the value, or the reduced DISTINCT set."""
+    def _aggregate_source(func_info: Dict[str, Any], key: str, index: int) -> Any:
+        """$project expression for an accumulator: the value, or the reduced DISTINCT set.
+
+        SUM of no (non-NULL) values is NULL, not $sum's 0.
+        """
         if not func_info.get("distinct"):
+            if func_info["function"] == "SUM":
+                return {"$cond": [{"$gt": [f"$__numbers{index}", 0]}, f"${key}", None]}
             return f"${key}"
         # SQL ignores NULL in DISTINCT aggregates
         values = {"$setDifference": [f"${key}", [None]]}
         reducer = {"COUNT": "$size", "SUM": "$sum", "AVG": "$avg", "MIN": "$min", "MAX": "$max"}
+        if func_info["function"] == "SUM":
+            numbers = {"$filter": {"input": values, "cond": {"$isNumber": "$$this"}}}
+            return {"$cond": [{"$gt": [{"$size": numbers}, 0]}, {"$sum": values}, None]}
         return {reducer[func_info["function"]]: values}
 
     @staticmethod
@@ -370,8 +378,26 @@ class ExecutionPlanBuilder:
                 group_stage[key] = {"$sum": {"$cond": [{"$gt": [f"${arg}", None]}, 1, 0]}}
             else:
                 group_stage[key] = {accumulator: f"${arg}"}
+                if func_name == "SUM":
+                    # $sum of no numbers is 0; SQL's SUM of no values is NULL
+                    group_stage[f"__numbers{i}"] = {"$sum": {"$cond": [{"$isNumber": f"${arg}"}, 1, 0]}}
 
-        pipeline.append({"$group": group_stage})
+        if group_keys:
+            pipeline.append({"$group": group_stage})
+        else:
+            # An aggregate without GROUP BY returns one row even for no input rows
+            # (COUNT 0, other aggregates NULL); $group alone would return none.
+            empty = {"_id": None}
+            for name, accumulator_spec in group_stage.items():
+                if name != "_id":
+                    operator = next(iter(accumulator_spec))
+                    empty[name] = {"$sum": 0, "$addToSet": []}.get(operator)
+            pipeline.append({"$facet": {"row": [{"$group": group_stage}]}})
+            pipeline.append(
+                {"$project": {"row": {"$cond": [{"$eq": [{"$size": "$row"}, 0]}, {"$literal": [empty]}, "$row"]}}}
+            )
+            pipeline.append({"$unwind": "$row"})
+            pipeline.append({"$replaceRoot": {"newRoot": "$row"}})
 
         # Map every SELECT item, in order, to its output name and source
         project_stage = {"_id": 0}
@@ -381,7 +407,9 @@ class ExecutionPlanBuilder:
             if "aggregate" in item:
                 func_info = parse_result.aggregate_functions[item["aggregate"]]
                 output, key = func_info["alias"], accumulator_keys[item["aggregate"]]
-                source = 1 if key == output else ExecutionPlanBuilder._aggregate_source(func_info, key)
+                source = ExecutionPlanBuilder._aggregate_source(func_info, key, item["aggregate"])
+                if source == f"${key}" and key == output:
+                    source = 1
                 output_for[func_info["expression"].upper()] = output
             else:
                 name = item.get("field") or item["computed"]
@@ -395,7 +423,7 @@ class ExecutionPlanBuilder:
         for name, source in hidden.items():
             if isinstance(source, int):  # a hidden aggregate: index into aggregate_functions
                 project_stage[name] = ExecutionPlanBuilder._aggregate_source(
-                    parse_result.aggregate_functions[source], accumulator_keys[source]
+                    parse_result.aggregate_functions[source], accumulator_keys[source], source
                 )
             else:
                 project_stage[name] = source

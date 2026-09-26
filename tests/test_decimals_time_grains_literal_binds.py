@@ -277,3 +277,41 @@ class TestLive:
         with sqlalchemy_engine.connect() as c:
             assert list(c.exec_driver_sql(sql).scalars()) == [99]
             assert list(c.execute(stmt).scalars()) == [99]
+
+
+class TestLiveAggregateNullSemantics:
+    @pytest.fixture
+    def null_docs(self, conn):
+        name = COLLECTION + "_nulls"
+        conn.database.drop_collection(name)
+        conn.database[name].insert_many(
+            [
+                {"_id": 1, "g": "a", "amt": None},
+                {"_id": 2, "g": "b", "amt": Decimal128("1.5")},
+                {"_id": 3, "g": "b"},
+                {"_id": 4, "g": "c", "amt": 0},
+            ]
+        )
+        yield conn, name
+        conn.database.drop_collection(name)
+
+    def rows(self, conn, sql):
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        return [tuple(r) for r in cursor.fetchall()]
+
+    def test_sum_of_no_values_is_null(self, null_docs):
+        conn, name = null_docs
+        rows = self.rows(conn, f"SELECT g, SUM(amt) AS s, SUM(DISTINCT amt) AS d FROM {name} GROUP BY g ORDER BY g")
+        assert rows == [("a", None, None), ("b", Decimal("1.5"), Decimal("1.5")), ("c", 0, 0)]
+        assert self.rows(conn, f"SELECT SUM(amt) AS s FROM {name} WHERE g = 'a'") == [(None,)]
+
+    def test_aggregate_without_group_by_returns_one_row_for_no_input(self, null_docs):
+        conn, name = null_docs
+        empty = f"FROM {name} WHERE g = 'none'"
+        assert self.rows(
+            conn, f"SELECT SUM(amt) AS s, COUNT(*) AS n, COUNT(DISTINCT g) AS d, MAX(amt) AS m {empty}"
+        ) == [(None, 0, 0, None)]
+        assert self.rows(conn, f"SELECT COUNT(*) AS n {empty} HAVING COUNT(*) > 0") == []
+        assert self.rows(conn, f"SELECT g, COUNT(*) AS n {empty} GROUP BY g") == []
+        assert self.rows(conn, f"SELECT COUNT(*) AS n FROM {name} LIMIT 0") == []
