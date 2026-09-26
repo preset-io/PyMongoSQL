@@ -63,14 +63,14 @@ class TestPlans:
         assert p.filter_stage == {"_id": {"$in": [1, 2.5, "a,b", "it's", True, "?"]}}
 
     def test_not_in(self):
-        assert plan("SELECT _id FROM t WHERE _id NOT IN (1, 2)").filter_stage == {"_id": {"$nin": [1, 2]}}
+        assert plan("SELECT _id FROM t WHERE _id NOT IN (1, 2)").filter_stage == {"_id": {"$nin": [1, 2, None]}}
 
     def test_field_ending_in_not_is_not_negated(self):
         assert plan("SELECT _id FROM t WHERE cannot IN (1)").filter_stage == {"cannot": {"$in": [1]}}
 
     def test_not_like_and_regex_metacharacters(self):
         p = plan("SELECT _id FROM t WHERE name NOT LIKE 'x.%'")
-        assert p.filter_stage == {"name": {"$not": {"$regex": "^x\\..*"}}}
+        assert p.filter_stage == {"$and": [{"name": {"$not": {"$regex": "^x\\..*"}}}, {"name": {"$ne": None}}]}
 
     def test_double_dash_inside_literal_is_not_a_comment(self):
         p = plan("SELECT _id FROM t WHERE name = 'a -- b' AND n = 1 -- trailing comment")

@@ -314,16 +314,15 @@ class WhereHandler(BaseHandler):
 
     def handle_visitor(self, ctx: PartiQLParser.WhereClauseSelectContext, parse_result: "QueryParseResult") -> Any:
         if hasattr(ctx, "exprSelect") and ctx.exprSelect():
+            from .where_tree import WhereTreeBuilder
+
+            # Translate over the parse tree with SQL three-valued logic. A clause that
+            # cannot be translated fails the query; it never falls back to a partial
+            # or text-search filter that would return different rows.
             try:
-                # Use enhanced expression handler for better parsing
-                filter_conditions = self._expression_handler.handle(ctx)
-                parse_result.filter_conditions = filter_conditions
-                return filter_conditions
+                parse_result.filter_conditions = WhereTreeBuilder().build(ctx.exprSelect())
             except Exception as e:
-                _logger.warning(f"Failed to parse WHERE expression, falling back to text search: {e}")
-                # Fallback to simple text search
-                filter_text = ctx.exprSelect().getText()
-                fallback_filter = {"$text": {"$search": filter_text}}
-                parse_result.filter_conditions = fallback_filter
-                return fallback_filter
+                parse_result.unsupported_clauses.append(f"WHERE ({e})")
+                parse_result.filter_conditions = {}
+            return parse_result.filter_conditions
         return {}

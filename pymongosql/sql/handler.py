@@ -257,6 +257,12 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
         if operator == "=":
             return {field_name: value}
 
+        # SQL <>, NOT IN and NOT LIKE are never TRUE for a NULL or missing field
+        if operator in ("!=", "<>", "NOT IN", "NOT LIKE") or (operator == "LIKE" and value == "?"):
+            from .where_tree import leaf_filters
+
+            return leaf_filters(field_name, operator, value)[0]
+
         # Handle special operators
         if operator in ("IN", "NOT IN"):
             values = value if isinstance(value, list) else [value]
@@ -571,7 +577,7 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
         idx = text.upper().find("LIKE")
         if idx == -1:
             return ""
-        return text[idx + 4 :].strip().strip("'\"")
+        return self._parse_value(text[idx + 4 :].strip())
 
     def _extract_between_range(self, text: str) -> Optional[Tuple[Any, Any]]:
         """Extract range values from BETWEEN clause"""

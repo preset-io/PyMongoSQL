@@ -300,6 +300,11 @@ class ExecutionPlanBuilder:
     @staticmethod
     def _build_delete_plan(parse_result: "DeleteParseResult") -> "DeleteExecutionPlan":
         """Build a DELETE execution plan from DELETE parsing."""
+        from ..error import SqlSyntaxError
+
+        if parse_result.has_errors:
+            # An untranslated WHERE must never become an empty filter (every document)
+            raise SqlSyntaxError(parse_result.error_message or "DELETE parsing failed")
         _logger.debug(
             f"Building DELETE plan with collection: {parse_result.collection}, "
             f"filters: {parse_result.filter_conditions}"
@@ -314,6 +319,11 @@ class ExecutionPlanBuilder:
     @staticmethod
     def _build_update_plan(parse_result: "UpdateParseResult") -> "UpdateExecutionPlan":
         """Build an UPDATE execution plan from UPDATE parsing."""
+        from ..error import SqlSyntaxError
+
+        if parse_result.has_errors:
+            # An untranslated WHERE must never become an empty filter (every document)
+            raise SqlSyntaxError(parse_result.error_message or "UPDATE parsing failed")
         _logger.debug(
             f"Building UPDATE plan with collection: {parse_result.collection}, "
             f"update_fields: {parse_result.update_fields}, "

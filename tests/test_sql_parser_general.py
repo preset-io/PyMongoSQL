@@ -101,7 +101,7 @@ class TestSQLParserGeneral:
 
         execution_plan = parser.get_execution_plan()
         assert execution_plan.collection == "users"
-        assert execution_plan.filter_stage == {"status": {"$ne": "inactive"}}
+        assert execution_plan.filter_stage == {"status": {"$nin": ["inactive", None]}}
         assert execution_plan.projection_stage == {"name": 1}
 
     def test_select_with_and_condition(self):
@@ -335,7 +335,7 @@ class TestSQLParserGeneral:
         # Verify complex filter structure with mixed AND/OR conditions
         expected_filter = {
             "$or": [
-                {"$and": [{"age": {"$gt": 25}}, {"status": "active"}, {"name": {"$ne": "John"}}]},
+                {"$and": [{"age": {"$gt": 25}}, {"status": "active"}, {"name": {"$nin": ["John", None]}}]},
                 {"department": {"$in": ["IT", "HR"]}},
             ]
         }

@@ -157,7 +157,7 @@ class TestWhereClauseFieldOrdering:
     def test_bool_not_equal_and_comparison(self):
         sql = "SELECT * FROM col WHERE active!=false AND age>25"
         plan = SQLParser(sql).get_execution_plan()
-        assert plan.filter_stage == {"$and": [{"active": {"$ne": False}}, {"age": {"$gt": 25}}]}
+        assert plan.filter_stage == {"$and": [{"active": {"$nin": [False, None]}}, {"age": {"$gt": 25}}]}
 
     # --- null mixed with bool ---
 
