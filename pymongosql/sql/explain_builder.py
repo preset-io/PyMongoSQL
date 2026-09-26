@@ -91,8 +91,7 @@ class ExplainExecutionPlan(ExecutionPlan):
             raise ProgrammingError("No collection specified in query")
 
         filter_stage = inner_plan.filter_stage or {}
-        if parameters:
-            filter_stage = SQLHelper.replace_placeholders_generic(filter_stage, parameters, "qmark")
+        filter_stage, _ = SQLHelper.bind_filter(filter_stage, parameters)
 
         command = {"find": inner_plan.collection, "filter": filter_stage}
 

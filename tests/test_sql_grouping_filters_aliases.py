@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-from pymongosql.error import Error
 from pymongosql.sql.parser import SQLParser
 from tests.conftest import HAS_SQLALCHEMY, make_superset_conn
 
@@ -54,13 +53,13 @@ class TestPlans:
         with pytest.raises(Exception, match="must appear in GROUP BY"):
             plan("SELECT flag, COUNT(*) FROM t")
 
-    def test_having_is_rejected_not_ignored(self):
-        with pytest.raises(Exception, match="HAVING"):
-            plan("SELECT flag, COUNT(*) AS n FROM t GROUP BY flag HAVING COUNT(*) > 1")
+    def test_having_filters_groups(self):
+        stages = pipeline("SELECT flag, COUNT(*) AS n FROM t GROUP BY flag HAVING COUNT(*) > 1")
+        assert stages[2] == {"$match": {"n": {"$gt": 1}}}
 
     def test_in_keeps_literal_types_and_quoted_commas(self):
         p = plan("SELECT _id FROM t WHERE _id IN (1, 2.5, 'a,b', 'it''s', TRUE, ?)")
-        assert p.filter_stage == {"_id": {"$in": [1, 2.5, "a,b", "it's", True, "?"]}}
+        assert p.filter_stage == {"_id": {"$in": [1, 2.5, "a,b", "it's", True, {"$pymongosqlParam": True}]}}
 
     def test_not_in(self):
         assert plan("SELECT _id FROM t WHERE _id NOT IN (1, 2)").filter_stage == {"_id": {"$nin": [1, 2, None]}}
@@ -160,9 +159,9 @@ class TestLive:
         finally:
             conn.close()
 
-    def test_unsupported_having_raises(self, grouping_collection):
-        with pytest.raises(Error):
-            rows(grouping_collection, f"SELECT flag, COUNT(*) AS n FROM {COLLECTION} GROUP BY flag HAVING n > 1")
+    def test_having_returns_only_matching_groups(self, grouping_collection):
+        got = rows(grouping_collection, f"SELECT flag, COUNT(*) AS n FROM {COLLECTION} GROUP BY flag HAVING n > 1")
+        assert got == [(True, 3)]
 
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not available")

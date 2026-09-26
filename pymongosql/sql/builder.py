@@ -4,6 +4,8 @@ import logging
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
+from bson import json_util
+
 if TYPE_CHECKING:
     from .delete_builder import DeleteExecutionPlan
     from .delete_handler import DeleteParseResult
@@ -159,8 +161,8 @@ class ExecutionPlanBuilder:
         if parse_result.unsupported_clauses:
             raise NotSupportedError(f"Unsupported SQL clause: {', '.join(parse_result.unsupported_clauses)}")
 
-        # Auto-generate aggregate pipeline for SQL aggregate functions (COUNT, SUM, etc.) and GROUP BY
-        if parse_result.aggregate_functions or parse_result.group_by:
+        # Auto-generate aggregate pipeline for SQL aggregate functions (COUNT, SUM, etc.), GROUP BY and HAVING
+        if parse_result.aggregate_functions or parse_result.group_by or parse_result.having is not None:
             return ExecutionPlanBuilder._build_sql_aggregate_plan(parse_result)
 
         # ORDER BY may name a column by its SELECT alias; find() sorts on the field
@@ -185,6 +187,72 @@ class ExecutionPlanBuilder:
         # Now build and validate
         plan = builder.build()
         return plan
+
+    @staticmethod
+    def _aggregate_source(func_info: Dict[str, Any], key: str) -> Any:
+        """$project expression for an accumulator: the value, or the reduced DISTINCT set."""
+        if not func_info.get("distinct"):
+            return f"${key}"
+        # SQL ignores NULL in DISTINCT aggregates
+        values = {"$setDifference": [f"${key}", [None]]}
+        reducer = {"COUNT": "$size", "SUM": "$sum", "AVG": "$avg", "MIN": "$min", "MAX": "$max"}
+        return {reducer[func_info["function"]]: values}
+
+    @staticmethod
+    def _translate_having(parse_result: "QueryParseResult", group_keys: Dict[str, str], hidden: Dict[str, Any]) -> Any:
+        """Translate HAVING into a $match on the grouped outputs (SQL three-valued logic)."""
+        from .partiql.PartiQLParser import PartiQLParser
+        from .query_handler import SelectHandler
+        from .where_tree import _PATH_NODES, WhereTreeBuilder, _field_path
+
+        prefixes = [f"{q}." for q in (parse_result.collection_alias, parse_result.collection) if q]
+
+        def strip(name: str) -> str:
+            for prefix in prefixes:
+                if name.startswith(prefix) and len(name) > len(prefix):
+                    return name[len(prefix) :]
+            return name
+
+        outputs = {}
+        for item in parse_result.select_items:
+            if "aggregate" in item:
+                info = parse_result.aggregate_functions[item["aggregate"]]
+                outputs[(info["function"], info["argument"], bool(info.get("distinct")))] = info["alias"]
+            else:
+                outputs[item["field"]] = item["alias"] or item["field"]
+        aliases = set(outputs.values())
+
+        def resolve(node: Any) -> Any:
+            if isinstance(node, (PartiQLParser.CountAllContext, PartiQLParser.AggregateBaseContext)):
+                kind, detail = SelectHandler._classify_item(node)
+                if kind != "aggregate":
+                    raise ValueError(f"Unsupported aggregate in HAVING: {node.getText()}")
+                func, arg, distinct = detail
+                signature = (func, strip(arg) if arg != "*" else arg, distinct)
+                if signature in outputs:
+                    return outputs[signature]
+                name = f"__having{len(hidden)}"
+                parse_result.aggregate_functions.append(
+                    {"function": func, "argument": signature[1], "distinct": distinct, "alias": name, "expression": ""}
+                )
+                hidden[name] = len(parse_result.aggregate_functions) - 1
+                outputs[signature] = name
+                return name
+            if isinstance(node, _PATH_NODES):
+                name = strip(_field_path(node))
+                if name in aliases:
+                    return name
+                if name in outputs:
+                    return outputs[name]
+                if name in group_keys:
+                    hidden_name = f"__having{len(hidden)}"
+                    hidden[hidden_name] = f"$_id.{group_keys[name]}"
+                    outputs[name] = hidden_name
+                    return hidden_name
+                raise ValueError(f"HAVING column '{name}' must be grouped, aggregated or a SELECT alias")
+            return None
+
+        return WhereTreeBuilder(resolver=resolve).build(parse_result.having)
 
     @staticmethod
     def _build_sql_aggregate_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":
@@ -214,6 +282,14 @@ class ExecutionPlanBuilder:
 
         group_keys = {name: f"g{i}" for i, name in enumerate(parse_result.group_by)}
         group_stage = {"_id": {key: f"${name}" for name, key in group_keys.items()} if group_keys else None}
+
+        # HAVING may name select-list outputs, grouped columns or aggregates; the ones
+        # not in the SELECT list are computed as hidden outputs and removed afterwards.
+        hidden: Dict[str, Any] = {}
+        having_filter = None
+        if parse_result.having is not None:
+            having_filter = ExecutionPlanBuilder._translate_having(parse_result, group_keys, hidden)
+
         accumulator_keys = []
         for i, func_info in enumerate(parse_result.aggregate_functions):
             func_name = func_info["function"]
@@ -221,11 +297,14 @@ class ExecutionPlanBuilder:
             accumulator = _FUNCTION_TO_ACCUMULATOR[func_name]
             # $group output names may not contain "." or start with "$", nor repeat
             key = func_info["alias"]
-            if "." in key or key.startswith("$") or key == "_id" or key in group_stage:
+            if func_info.get("distinct") or "." in key or key.startswith("$") or key == "_id" or key in group_stage:
                 key = f"__agg{i}"
             accumulator_keys.append(key)
 
-            if func_name == "COUNT" and arg == "*":
+            if func_info.get("distinct"):
+                # Collect the distinct values; the $project stage reduces the set
+                group_stage[key] = {"$addToSet": f"${arg}"}
+            elif func_name == "COUNT" and arg == "*":
                 group_stage[key] = {accumulator: 1}
             elif func_name == "COUNT":
                 # COUNT(field) counts documents where the field is present and not null
@@ -243,7 +322,7 @@ class ExecutionPlanBuilder:
             if "aggregate" in item:
                 func_info = parse_result.aggregate_functions[item["aggregate"]]
                 output, key = func_info["alias"], accumulator_keys[item["aggregate"]]
-                source = 1 if key == output else f"${key}"
+                source = 1 if key == output else ExecutionPlanBuilder._aggregate_source(func_info, key)
                 output_for[func_info["expression"].upper()] = output
             else:
                 name = item["field"]
@@ -254,7 +333,18 @@ class ExecutionPlanBuilder:
             output_for[output] = output
             project_stage[output] = source
             outputs.append(output)
+        for name, source in hidden.items():
+            if isinstance(source, int):  # a hidden aggregate: index into aggregate_functions
+                project_stage[name] = ExecutionPlanBuilder._aggregate_source(
+                    parse_result.aggregate_functions[source], accumulator_keys[source]
+                )
+            else:
+                project_stage[name] = source
         pipeline.append({"$project": project_stage})
+        if having_filter is not None:
+            pipeline.append({"$match": having_filter})
+            if hidden:
+                pipeline.append({"$project": {name: 0 for name in hidden}})
 
         sort_stage = {}
         for spec in parse_result.sort_fields:
@@ -273,7 +363,8 @@ class ExecutionPlanBuilder:
         # Configure the execution plan as an aggregate query
         builder._execution_plan.is_aggregate_query = True
         builder._execution_plan.aggregate_parameterized = True
-        builder._execution_plan.aggregate_pipeline = json.dumps(pipeline)
+        # Extended JSON keeps Decimal128/datetime literals and parameter markers intact
+        builder._execution_plan.aggregate_pipeline = json_util.dumps(pipeline)
         builder._execution_plan.aggregate_options = json.dumps({})
 
         # Set projection for ResultSet description, in SELECT order

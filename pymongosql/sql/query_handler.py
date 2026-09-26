@@ -42,6 +42,8 @@ class QueryParseResult:
     unsupported_clauses: List[str] = field(default_factory=list)
     # FROM alias (FROM users AS u / FROM users u)
     collection_alias: Optional[str] = None
+    # HAVING expression (parse-tree node), translated after grouping
+    having: Any = None
 
     # Subquery info (for wrapped subqueries, e.g., Superset outering)
     subquery_plan: Optional[Any] = None
@@ -139,23 +141,27 @@ class SelectHandler(BaseHandler, ContextUtilsMixin):
         if hasattr(ctx, "projectionItems") and ctx.projectionItems():
             for item in ctx.projectionItems().projectionItem():
                 field_name, alias = self._extract_field_and_alias(item)
+                kind, detail = self._classify_item(item)
 
-                # Check if this is an aggregate function (COUNT, SUM, etc.)
-                agg_match = self._AGGREGATE_PATTERN.match(field_name)
-                if agg_match:
-                    func_name = agg_match.group(1).upper()
-                    func_arg = agg_match.group(2)
+                if kind == "aggregate":
+                    func_name, func_arg, distinct = detail
                     parse_result.select_items.append({"aggregate": len(parse_result.aggregate_functions)})
                     parse_result.aggregate_functions.append(
                         {
                             "function": func_name,
                             "argument": func_arg,
+                            "distinct": distinct,
                             "alias": alias or field_name,
                             "expression": field_name,
                         }
                     )
                     continue
+                if kind == "unsupported":
+                    # e.g. a + 1 or lower(a): projecting it as a field would silently read NULL
+                    parse_result.unsupported_clauses.append(f"SELECT {detail}")
+                    continue
 
+                field_name = detail
                 parse_result.select_items.append({"field": field_name, "alias": alias})
                 # Use MongoDB standard projection format: {field: 1} to include field
                 projection[field_name] = 1
@@ -166,6 +172,36 @@ class SelectHandler(BaseHandler, ContextUtilsMixin):
         parse_result.projection = projection
         parse_result.column_aliases = column_aliases
         return projection
+
+    _AGGREGATES = ("COUNT", "SUM", "AVG", "MIN", "MAX")
+
+    @staticmethod
+    def _classify_item(item) -> Tuple[str, Any]:
+        """("field", path) | ("aggregate", (function, argument, distinct)) | ("unsupported", text)."""
+        from .where_tree import _PATH_NODES, _field_path, _unwrap
+
+        # A projection item's first child is its expression; other nodes are classified as-is
+        is_item = isinstance(item, PartiQLParser.ProjectionItemContext)
+        expr = item.children[0] if is_item and getattr(item, "children", None) else item
+        if not hasattr(expr, "getRuleIndex"):
+            return "unsupported", str(expr)
+        node = _unwrap(expr)
+        try:
+            if isinstance(node, PartiQLParser.CountAllContext):
+                return "aggregate", ("COUNT", "*", False)
+            if isinstance(node, PartiQLParser.AggregateBaseContext):
+                func = node.func.text.upper()
+                quantifier = node.setQuantifierStrategy()
+                argument = _unwrap(node.expr())
+                if func not in SelectHandler._AGGREGATES or not isinstance(argument, _PATH_NODES):
+                    return "unsupported", node.getText()
+                distinct = quantifier is not None and quantifier.getText().upper() == "DISTINCT"
+                return "aggregate", (func, _field_path(argument), distinct)
+            if isinstance(node, _PATH_NODES):
+                return "field", _field_path(node)
+        except Exception:
+            pass
+        return "unsupported", node.getText()
 
     def _extract_field_and_alias(self, item) -> Tuple[str, Optional[str]]:
         """Extract field name and alias from projection item context with nested field support"""

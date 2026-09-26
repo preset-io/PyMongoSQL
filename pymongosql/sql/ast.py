@@ -303,8 +303,8 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
         return None
 
     def visitHavingClause(self, ctx: PartiQLParser.HavingClauseContext) -> Any:
-        """HAVING is not translated; record it so the query fails instead of ignoring it."""
-        self._query_parse_result.unsupported_clauses.append("HAVING")
+        """Keep the HAVING expression; it is translated after the $group stage."""
+        self._query_parse_result.having = ctx.arg
         return None
 
     def visitLimitClause(self, ctx: PartiQLParser.LimitClauseContext) -> Any:
@@ -317,8 +317,11 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
                     limit_value = int(limit_text)
                     self._query_parse_result.limit_value = limit_value
                     _logger.debug(f"Extracted limit value: {limit_value}")
-                except ValueError as e:
-                    _logger.warning(f"Invalid LIMIT value '{limit_text}': {e}")
+                except ValueError:
+                    # e.g. LIMIT ?: dropping it would return every row
+                    self._query_parse_result.unsupported_clauses.append(
+                        f"LIMIT {limit_text} (needs an integer literal)"
+                    )
             return self.visitChildren(ctx)
         except Exception as e:
             _logger.warning(f"Error processing LIMIT clause: {e}")
@@ -334,8 +337,10 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
                     offset_value = int(offset_text)
                     self._query_parse_result.offset_value = offset_value
                     _logger.debug(f"Extracted offset value: {offset_value}")
-                except ValueError as e:
-                    _logger.warning(f"Invalid OFFSET value '{offset_text}': {e}")
+                except ValueError:
+                    self._query_parse_result.unsupported_clauses.append(
+                        f"OFFSET {offset_text} (needs an integer literal)"
+                    )
             return self.visitChildren(ctx)
         except Exception as e:
             _logger.warning(f"Error processing OFFSET clause: {e}")

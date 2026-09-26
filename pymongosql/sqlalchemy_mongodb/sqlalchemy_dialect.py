@@ -111,6 +111,15 @@ class PyMongoSQLCompiler(compiler.SQLCompiler):
         """
         return super().visit_column(column, include_table=False, **kwargs)
 
+    def limit_clause(self, select, **kw):
+        """Render LIMIT/OFFSET as integer literals: PyMongoSQL reads them while parsing."""
+        text = ""
+        if select._limit_clause is not None:
+            text += "\n LIMIT " + self.process(select._limit_clause, literal_binds=True, **kw)
+        if select._offset_clause is not None:
+            text += "\n OFFSET " + self.process(select._offset_clause, literal_binds=True, **kw)
+        return text
+
     def visit_like_op_binary(self, binary, operator, **kw):
         """Render LIKE patterns inline: PyMongoSQL turns them into a regex while parsing."""
         kw["literal_binds"] = True

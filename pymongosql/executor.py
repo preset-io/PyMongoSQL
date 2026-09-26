@@ -149,9 +149,8 @@ class StandardQueryExecution(ExecutionStrategy):
             # Replace placeholders with parameters in filter_stage only (not in projection)
             filter_stage = execution_plan.filter_stage or {}
 
-            if parameters:
-                # Positional parameters with ? (named parameters are converted to positional in execute())
-                filter_stage = self._replace_placeholders(filter_stage, parameters)
+            # Positional parameters (named ones are converted to positional in execute())
+            filter_stage, _ = SQLHelper.bind_filter(filter_stage, parameters)
 
             projection_stage = execution_plan.projection_stage or {}
 
@@ -223,7 +222,12 @@ class StandardQueryExecution(ExecutionStrategy):
 
             # Parse pipeline and options from JSON strings
             try:
-                pipeline = json.loads(execution_plan.aggregate_pipeline or "[]")
+                if execution_plan.aggregate_parameterized:
+                    from bson import json_util
+
+                    pipeline = json_util.loads(execution_plan.aggregate_pipeline or "[]")
+                else:
+                    pipeline = json.loads(execution_plan.aggregate_pipeline or "[]")
                 options = json.loads(execution_plan.aggregate_options or "{}")
             except json.JSONDecodeError as e:
                 raise ProgrammingError(f"Invalid JSON in aggregate pipeline or options: {e}")
@@ -232,9 +236,9 @@ class StandardQueryExecution(ExecutionStrategy):
             _logger.debug(f"Pipeline: {pipeline}")
             _logger.debug(f"Options: {options}")
 
-            # A pipeline generated from SQL carries the WHERE clause's ? placeholders
-            if parameters and execution_plan.aggregate_parameterized:
-                pipeline = self._replace_placeholders(pipeline, parameters)
+            # A pipeline generated from SQL carries the WHERE clause's parameter markers
+            if execution_plan.aggregate_parameterized:
+                pipeline, _ = SQLHelper.bind_filter(pipeline, parameters)
 
             # Get collection and call aggregate()
             collection = db[execution_plan.collection]
@@ -517,11 +521,8 @@ class DeleteExecution(ExecutionStrategy):
 
             filter_conditions = execution_plan.filter_conditions or {}
 
-            # Replace placeholders in filter if parameters provided
-            if parameters and filter_conditions:
-                filter_conditions = SQLHelper.replace_placeholders_generic(
-                    filter_conditions, parameters, execution_plan.parameter_style
-                )
+            # Bind the WHERE clause's parameter markers; every parameter must be used
+            filter_conditions, _ = SQLHelper.bind_filter(filter_conditions, parameters)
 
             command = {"delete": execution_plan.collection, "deletes": [{"q": filter_conditions, "limit": 0}]}
 
@@ -604,12 +605,20 @@ class UpdateExecution(ExecutionStrategy):
             # Replace placeholders if parameters provided
             # Note: We need to replace both update_fields and filter_conditions in one pass
             # to maintain correct parameter ordering (SET clause first, then WHERE clause)
-            if parameters:
-                # Combine structures for replacement in correct order
-                combined = {"update_fields": update_fields, "filter_conditions": filter_conditions}
-                replaced = SQLHelper.replace_placeholders_generic(combined, parameters, execution_plan.parameter_style)
-                update_fields = replaced["update_fields"]
-                filter_conditions = replaced["filter_conditions"]
+            if isinstance(parameters, dict):
+                update_fields = SQLHelper.replace_placeholders_generic(
+                    update_fields, parameters, execution_plan.parameter_style
+                )
+                filter_conditions, _ = SQLHelper.bind_filter(filter_conditions, [])
+            else:
+                # SET values carry "?" placeholders; the WHERE clause carries parameter markers
+                params = list(parameters or [])
+                set_count = SQLHelper.count_placeholders(update_fields)
+                if set_count:
+                    update_fields = SQLHelper.replace_placeholders_generic(
+                        update_fields, params[:set_count], execution_plan.parameter_style or "qmark"
+                    )
+                filter_conditions, _ = SQLHelper.bind_filter(filter_conditions, params[set_count:])
 
             # MongoDB update command format
             # https://www.mongodb.com/docs/manual/reference/command/update/

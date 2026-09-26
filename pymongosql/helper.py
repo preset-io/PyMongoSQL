@@ -120,6 +120,51 @@ class SQLHelper:
         return value
 
     @staticmethod
+    def bind_filter(value: Any, parameters: Any, exact: bool = True) -> Tuple[Any, int]:
+        """Bind positional parameters to the parameter markers of a translated filter.
+
+        Translated WHERE clauses mark each ``?`` with a dict marker, so a string literal
+        '?' is never taken for a parameter. With ``exact``, every parameter must be used:
+        a parameter the translation dropped (e.g. a LIMIT it could not read) must not
+        silently widen the query. Returns the bound value and the number used.
+        """
+        from .sql.where_tree import is_param
+
+        params = [] if parameters is None else parameters
+        if isinstance(params, dict) or not isinstance(params, Sequence) or isinstance(params, (str, bytes)):
+            raise ProgrammingError("Positional parameters must be provided as a sequence")
+        idx = [0]
+
+        def replace(val: Any) -> Any:
+            if is_param(val):
+                if idx[0] >= len(params):
+                    raise ProgrammingError("Not enough parameters provided")
+                out = params[idx[0]]
+                idx[0] += 1
+                return SQLHelper.to_bson_value(out)
+            if isinstance(val, dict):
+                return {k: replace(v) for k, v in val.items()}
+            if isinstance(val, list):
+                return [replace(v) for v in val]
+            return val
+
+        bound = replace(value)
+        if exact and idx[0] != len(params):
+            raise ProgrammingError(f"{len(params)} parameters were given but the statement uses {idx[0]}")
+        return bound, idx[0]
+
+    @staticmethod
+    def count_placeholders(value: Any) -> int:
+        """Number of legacy "?" placeholders (INSERT values, UPDATE SET) in a structure."""
+        if isinstance(value, str):
+            return int(value == "?")
+        if isinstance(value, dict):
+            return sum(SQLHelper.count_placeholders(v) for v in value.values())
+        if isinstance(value, list):
+            return sum(SQLHelper.count_placeholders(v) for v in value)
+        return 0
+
+    @staticmethod
     def replace_placeholders_generic(value: Any, parameters: Any, style: Optional[str]) -> Any:
         """Recursively replace placeholders in nested structures for qmark or named styles."""
         if style is None or parameters is None:
