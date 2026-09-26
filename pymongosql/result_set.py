@@ -4,6 +4,7 @@ import re
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import jmespath
+from bson import Decimal128, Int64
 from pymongo.errors import PyMongoError
 
 from . import STRING
@@ -63,7 +64,7 @@ class ResultSet(CursorIterator):
         if not batch:
             return
         # Process results through projection mapping
-        processed_batch = [self._process_document(doc) for doc in batch]
+        processed_batch = [self._to_python(self._process_document(doc)) for doc in batch]
         # Convert dictionaries to output format (sequence or dict)
         formatted_batch = [self._format_result(doc) for doc in processed_batch]
         self._cached_results.extend(formatted_batch)
@@ -158,6 +159,24 @@ class ResultSet(CursorIterator):
                 processed[display_key] = value
 
         return processed
+
+    @classmethod
+    def _to_python(cls, value: Any) -> Any:
+        """Return standard Python types for BSON-specific numbers.
+
+        DB API 2.0 consumers expect ``decimal.Decimal`` and ``int``; PyMongo returns
+        ``bson.Decimal128`` (which most libraries cannot sum or serialise) and, in
+        command responses, ``bson.Int64``.
+        """
+        if isinstance(value, Decimal128):
+            return value.to_decimal()
+        if isinstance(value, Int64):
+            return int(value)
+        if isinstance(value, dict):
+            return {k: cls._to_python(v) for k, v in value.items()}
+        if isinstance(value, list):
+            return [cls._to_python(v) for v in value]
+        return value
 
     def _mongo_to_bracket_key(self, field_path: str) -> str:
         """Convert Mongo dot-index notation to bracket notation.
