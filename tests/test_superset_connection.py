@@ -1,4 +1,6 @@
 # -*- coding: utf-8 -*-
+import pytest
+
 from pymongosql.executor import ExecutionContext, ExecutionPlanFactory
 from pymongosql.helper import ConnectionHelper
 from pymongosql.superset_mongodb.executor import SupersetExecution
@@ -142,9 +144,9 @@ class TestSubqueryExecutionIntegration:
         cursor = conn.cursor()
         subquery_sql = "SELECT * FROM (SELECT _id, name FROM users) AS u WHERE u.age > 25"
 
-        cursor.execute(subquery_sql)
-        rows = cursor.fetchall()
-        assert len(rows) == 0
+        # Standard mode cannot evaluate a subquery; it must fail, not return no rows
+        with pytest.raises(Exception, match="subquery"):
+            cursor.execute(subquery_sql)
 
     def test_core_connection_with_standard_queries(self, conn):
         """Test simple query on users collection"""

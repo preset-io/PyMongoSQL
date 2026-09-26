@@ -123,11 +123,13 @@ class ExecutionPlanBuilder:
         collection = parse_result.collection
         if not collection:
             return
-        prefix = f"{collection}."
+        # With FROM users AS u, u.name is the column name; so is users.name
+        prefixes = [f"{q}." for q in (parse_result.collection_alias, collection) if q]
 
         def strip(name: Any) -> Any:
-            if isinstance(name, str) and name.startswith(prefix) and len(name) > len(prefix):
-                return name[len(prefix) :]
+            for prefix in prefixes:
+                if isinstance(name, str) and name.startswith(prefix) and len(name) > len(prefix):
+                    return name[len(prefix) :]
             return name
 
         def strip_filter(value: Any) -> Any:
@@ -143,6 +145,10 @@ class ExecutionPlanBuilder:
         parse_result.filter_conditions = strip_filter(parse_result.filter_conditions)
         for func_info in parse_result.aggregate_functions:
             func_info["argument"] = strip(func_info["argument"])
+        parse_result.group_by = [strip(name) for name in parse_result.group_by]
+        for item in parse_result.select_items:
+            if "field" in item:
+                item["field"] = strip(item["field"])
 
     @staticmethod
     def _build_query_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":

@@ -40,6 +40,8 @@ class QueryParseResult:
     group_by: List[str] = field(default_factory=list)
     # Clauses that are parsed but cannot be translated faithfully
     unsupported_clauses: List[str] = field(default_factory=list)
+    # FROM alias (FROM users AS u / FROM users u)
+    collection_alias: Optional[str] = None
 
     # Subquery info (for wrapped subqueries, e.g., Superset outering)
     subquery_plan: Optional[Any] = None
@@ -269,6 +271,35 @@ class FromHandler(BaseHandler):
             _logger.debug(f"Error parsing function call: {e}")
             return None
 
+    @staticmethod
+    def _collection_reference(table_ref: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return (collection text, alias, problem) for a FROM table reference.
+
+        Only a single collection, optionally aliased, can be translated. Joins, subqueries
+        and AT/BY bindings are reported as a problem so the query fails instead of reading
+        a collection named after the whole clause.
+        """
+        if not hasattr(table_ref, "getRuleIndex"):
+            return table_ref.getText(), None, None  # not a parse-tree node: a plain name
+        while isinstance(table_ref, PartiQLParser.TableWrappedContext):
+            table_ref = table_ref.tableReference()
+        if not isinstance(table_ref, PartiQLParser.TableRefBaseContext):
+            return None, None, "FROM with a join"
+        base = table_ref.tableNonJoin().tableBaseReference()
+        if isinstance(base, PartiQLParser.TableBaseRefSymbolContext):
+            source, alias = base.source, base.symbolPrimitive().getText()
+        elif isinstance(base, PartiQLParser.TableBaseRefClausesContext):
+            if base.atIdent() is not None or base.byIdent() is not None:
+                return None, None, "FROM ... AT/BY"
+            source = base.source
+            alias = base.asIdent().symbolPrimitive().getText() if base.asIdent() is not None else None
+        else:
+            return None, None, "FROM with UNPIVOT or a graph match"
+        text = source.getText()
+        if text.startswith("("):
+            return None, None, "FROM a subquery (use mode=superset)"
+        return text, alias, None
+
     def handle_visitor(self, ctx: PartiQLParser.FromClauseContext, parse_result: "QueryParseResult") -> Any:
         """Handle FROM clause - detect aggregate calls or regular collections"""
         if hasattr(ctx, "tableReference") and ctx.tableReference():
@@ -291,12 +322,16 @@ class FromHandler(BaseHandler):
                 _logger.info(f"Parsed aggregate call: collection={func_info['collection']}")
                 return func_info
 
-            # Regular collection reference
-            table_text = ctx.tableReference().getText()
+            # Regular collection reference, optionally aliased
+            source, alias, problem = self._collection_reference(ctx.tableReference())
+            if problem:
+                parse_result.unsupported_clauses.append(problem)
+                return None
             # Strip surrounding quotes from collection name (e.g., "user.accounts" -> user.accounts)
-            collection_name = self._strip_collection_quotes(table_text)
+            collection_name = self._strip_collection_quotes(source)
             parse_result.collection = collection_name
-            _logger.debug(f"Parsed regular collection: {collection_name}")
+            parse_result.collection_alias = ContextUtilsMixin.unquote_identifier(alias) if alias else None
+            _logger.debug(f"Parsed regular collection: {collection_name} (alias {alias})")
             return collection_name
 
         return None
