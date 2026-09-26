@@ -315,3 +315,19 @@ class TestLiveAggregateNullSemantics:
         assert self.rows(conn, f"SELECT COUNT(*) AS n {empty} HAVING COUNT(*) > 0") == []
         assert self.rows(conn, f"SELECT g, COUNT(*) AS n {empty} GROUP BY g") == []
         assert self.rows(conn, f"SELECT COUNT(*) AS n FROM {name} LIMIT 0") == []
+
+
+class TestLiveEmptyVirtualDataset:
+    def test_inner_query_without_rows(self, grain_docs):
+        superset = make_superset_conn()
+        inner = f"(SELECT g, amt FROM {COLLECTION} WHERE g = 'none') AS virtual_table"
+        try:
+            cursor = superset.cursor()
+            cursor.execute(f'SELECT COUNT(*) AS "count", SUM(amt) AS s FROM {inner}')
+            assert [tuple(r) for r in cursor.fetchall()] == [(0, None)]
+            cursor.execute(f'SELECT g, COUNT(*) AS "count" FROM {inner} GROUP BY g')
+            assert cursor.fetchall() == []
+            cursor.execute(f"SELECT g FROM {inner}")
+            assert cursor.fetchall() == [] and [d[0] for d in cursor.description] == ["g"]
+        finally:
+            superset.close()
