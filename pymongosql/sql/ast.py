@@ -276,6 +276,10 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
                 for sort_spec in ctx.orderSortSpec():
                     field_name = sort_spec.expr().getText() if sort_spec.expr() else "_id"
                     field_name = ContextUtilsMixin.normalize_field_path(field_name)
+                    if sort_spec.expr() is not None:
+                        kind, detail = SelectHandler._classify_item(sort_spec.expr())
+                        if kind == "aggregate":
+                            self._query_parse_result.sort_aggregates[field_name] = detail
                     # Check for ASC/DESC (default is ASC = 1)
                     direction = 1  # ASC
                     if hasattr(sort_spec, "DESC") and sort_spec.DESC():

@@ -40,6 +40,8 @@ class QueryParseResult:
     group_by: List[str] = field(default_factory=list)
     # Computed expressions by their SQL text: {"unit": ..., "field": ...} for DATE_TRUNC
     computed: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    # ORDER BY aggregates by their SQL text: (function, argument, distinct)
+    sort_aggregates: Dict[str, Tuple[str, str, bool]] = field(default_factory=dict)
     # Clauses that are parsed but cannot be translated faithfully
     unsupported_clauses: List[str] = field(default_factory=list)
     # FROM alias (FROM users AS u / FROM users u)

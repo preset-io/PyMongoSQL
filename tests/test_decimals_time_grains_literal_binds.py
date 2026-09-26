@@ -331,3 +331,26 @@ class TestLiveEmptyVirtualDataset:
             assert cursor.fetchall() == [] and [d[0] for d in cursor.description] == ["g"]
         finally:
             superset.close()
+
+
+class TestLiveOrderByAggregateNotSelected:
+    def rows(self, conn, sql):
+        cursor = conn.cursor()
+        cursor.execute(sql)
+        return [tuple(r) for r in cursor.fetchall()]
+
+    def test_top_n_ordered_by_another_metric(self, grain_docs):
+        # Superset's series-limit pre-query: group by the series, order by the limit metric
+        sql = f'SELECT g AS g, COUNT(*) AS "count" FROM {COLLECTION} GROUP BY g ORDER BY sum(amt) DESC LIMIT 1'
+        assert self.rows(grain_docs, sql) == [("a", 3)]
+        sql = f"SELECT g, COUNT(*) AS n FROM {COLLECTION} GROUP BY g ORDER BY SUM({COLLECTION}.amt) ASC"
+        assert self.rows(grain_docs, sql) == [("b", 3), ("a", 3)]
+        sql = f"SELECT g, COUNT(*) AS n FROM {COLLECTION} GROUP BY g HAVING SUM(amt) > 5 ORDER BY MAX(amt) DESC"
+        assert self.rows(grain_docs, sql) == [("a", 3)]
+
+    def test_time_grain_with_having(self, grain_docs):
+        sql = (
+            f"SELECT DATE_TRUNC('month', ts) AS m, COUNT(*) AS n FROM {COLLECTION} "
+            "GROUP BY DATE_TRUNC('month', ts) HAVING COUNT(*) > 1 ORDER BY m"
+        )
+        assert self.rows(grain_docs, sql) == [(datetime.datetime(2026, 1, 1), 3)]

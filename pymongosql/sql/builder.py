@@ -279,7 +279,8 @@ class ExecutionPlanBuilder:
                 info = parse_result.aggregate_functions[item["aggregate"]]
                 outputs[(info["function"], info["argument"], bool(info.get("distinct")))] = info["alias"]
             else:
-                outputs[item["field"]] = item["alias"] or item["field"]
+                name = item.get("field") or item["computed"]
+                outputs[name] = item["alias"] or name
         aliases = set(outputs.values())
 
         def resolve(node: Any) -> Any:
@@ -357,6 +358,30 @@ class ExecutionPlanBuilder:
         if parse_result.having is not None:
             having_filter = ExecutionPlanBuilder._translate_having(parse_result, group_keys, hidden)
 
+        # ORDER BY may name an aggregate that is not selected (e.g. a top-N query ordered
+        # by another metric); it is computed as a hidden output like HAVING's.
+        order_outputs: Dict[str, str] = {}
+        prefixes = [f"{q}." for q in (parse_result.collection_alias, parse_result.collection) if q]
+        for text, (func, arg, distinct) in parse_result.sort_aggregates.items():
+            for prefix in prefixes:
+                if arg.startswith(prefix) and len(arg) > len(prefix):
+                    arg = arg[len(prefix) :]
+            selected = [
+                info["alias"]
+                for info in parse_result.aggregate_functions
+                if (info["function"], info["argument"], bool(info.get("distinct"))) == (func, arg, distinct)
+                and not info["alias"].startswith("__")
+            ]
+            if selected:
+                order_outputs[text] = selected[0]
+                continue
+            name = f"__order{len(order_outputs)}"
+            parse_result.aggregate_functions.append(
+                {"function": func, "argument": arg, "distinct": distinct, "alias": name, "expression": ""}
+            )
+            hidden[name] = len(parse_result.aggregate_functions) - 1
+            order_outputs[text] = name
+
         accumulator_keys = []
         for i, func_info in enumerate(parse_result.aggregate_functions):
             func_name = func_info["function"]
@@ -430,18 +455,18 @@ class ExecutionPlanBuilder:
         pipeline.append({"$project": project_stage})
         if having_filter is not None:
             pipeline.append({"$match": having_filter})
-            if hidden:
-                pipeline.append({"$project": {name: 0 for name in hidden}})
 
         sort_stage = {}
         for spec in parse_result.sort_fields:
             for name, direction in spec.items():
-                output = output_for.get(name, output_for.get(name.upper()))
+                output = output_for.get(name, output_for.get(name.upper(), order_outputs.get(name)))
                 if output is None:
                     raise NotSupportedError(f"ORDER BY '{name}' must name a selected column or its alias")
                 sort_stage[output] = direction
         if sort_stage:
             pipeline.append({"$sort": sort_stage})
+        if hidden:
+            pipeline.append({"$project": {name: 0 for name in hidden}})
         # OFFSET/LIMIT (integers or parameters) are applied by the executor after binding
         builder.skip(parse_result.offset_value).limit(parse_result.limit_value)
 
