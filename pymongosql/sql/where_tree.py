@@ -208,7 +208,7 @@ def operand(ctx: Any, resolver: Any = None) -> Any:
         name = node.functionName().getText()
         registry = get_default_registry()
         if registry.has_function(name):
-            args = [operand(arg) for arg in node.expr()]
+            args = [_coerce(operand(arg), as_double=True) for arg in node.expr()]
             if any(isinstance(a, _Field) or is_param(a) for a in args):
                 raise NotSupportedError(f"Value functions take literal arguments: {node.getText()}")
             return registry.execute(name, args)

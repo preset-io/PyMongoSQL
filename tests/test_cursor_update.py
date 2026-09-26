@@ -214,7 +214,7 @@ class TestCursorUpdate:
     def test_update_executemany_with_parameters(self, conn):
         """Test executemany for bulk update operations with parameters."""
         cursor = conn.cursor()
-        sql = f"UPDATE {self.TEST_COLLECTION} SET price = '?' WHERE title = '?'"
+        sql = f"UPDATE {self.TEST_COLLECTION} SET price = ? WHERE title = ?"
 
         # Update prices for multiple books using executemany
         params = [[25.99, "Book A"], [35.99, "Book B"], [45.99, "Book D"]]

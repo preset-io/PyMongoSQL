@@ -355,10 +355,8 @@ class ExecutionPlanBuilder:
                 sort_stage[output] = direction
         if sort_stage:
             pipeline.append({"$sort": sort_stage})
-        if parse_result.offset_value:
-            pipeline.append({"$skip": parse_result.offset_value})
-        if parse_result.limit_value is not None:
-            pipeline.append({"$limit": parse_result.limit_value})
+        # OFFSET/LIMIT (integers or parameters) are applied by the executor after binding
+        builder.skip(parse_result.offset_value).limit(parse_result.limit_value)
 
         # Configure the execution plan as an aggregate query
         builder._execution_plan.is_aggregate_query = True

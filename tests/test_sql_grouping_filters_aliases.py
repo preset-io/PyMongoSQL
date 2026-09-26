@@ -32,8 +32,10 @@ class TestPlans:
         assert stages[1]["$project"] == {"_id": 0, "flag": "$_id.g0", "n": 1}
 
     def test_aggregate_query_keeps_order_by_skip_and_limit(self):
-        stages = pipeline("SELECT dept, SUM(amount) AS total FROM t GROUP BY dept ORDER BY total DESC LIMIT 1 OFFSET 1")
-        assert stages[-3:] == [{"$sort": {"total": -1}}, {"$skip": 1}, {"$limit": 1}]
+        p = plan("SELECT dept, SUM(amount) AS total FROM t GROUP BY dept ORDER BY total DESC LIMIT 1 OFFSET 1")
+        assert json.loads(p.aggregate_pipeline)[-1] == {"$sort": {"total": -1}}
+        # OFFSET/LIMIT are applied after binding (they may be parameters)
+        assert (p.skip_stage, p.limit_stage) == (1, 1)
 
     def test_order_by_aggregate_expression_uses_its_output(self):
         stages = pipeline("SELECT dept, SUM(amount) AS total FROM t GROUP BY dept ORDER BY SUM(amount)")

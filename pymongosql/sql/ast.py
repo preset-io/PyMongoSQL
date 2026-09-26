@@ -308,43 +308,42 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
         return None
 
     def visitLimitClause(self, ctx: PartiQLParser.LimitClauseContext) -> Any:
-        """Handle LIMIT clause for result limiting"""
-        _logger.debug("Processing LIMIT clause")
-        try:
-            if hasattr(ctx, "exprSelect") and ctx.exprSelect():
-                limit_text = ctx.exprSelect().getText()
-                try:
-                    limit_value = int(limit_text)
-                    self._query_parse_result.limit_value = limit_value
-                    _logger.debug(f"Extracted limit value: {limit_value}")
-                except ValueError:
-                    # e.g. LIMIT ?: dropping it would return every row
-                    self._query_parse_result.unsupported_clauses.append(
-                        f"LIMIT {limit_text} (needs an integer literal)"
-                    )
-            return self.visitChildren(ctx)
-        except Exception as e:
-            _logger.warning(f"Error processing LIMIT clause: {e}")
-            return self.visitChildren(ctx)
+        """Handle LIMIT: a non-negative integer literal or a bound parameter."""
+        from .where_tree import is_param, operand
+
+        if hasattr(ctx, "exprSelect") and ctx.exprSelect():
+            try:
+                value = operand(ctx.exprSelect())
+            except Exception:
+                value = None
+            if is_param(value) or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+                self._query_parse_result.limit_value = value
+            else:
+                # Dropping it would return every row
+                text = ctx.exprSelect().getText()
+                self._query_parse_result.unsupported_clauses.append(
+                    f"LIMIT {text} (needs a non-negative integer or a parameter)"
+                )
+        return None
 
     def visitOffsetByClause(self, ctx: PartiQLParser.OffsetByClauseContext) -> Any:
-        """Handle OFFSET clause for result skipping"""
-        _logger.debug("Processing OFFSET clause")
-        try:
-            if hasattr(ctx, "exprSelect") and ctx.exprSelect():
-                offset_text = ctx.exprSelect().getText()
-                try:
-                    offset_value = int(offset_text)
-                    self._query_parse_result.offset_value = offset_value
-                    _logger.debug(f"Extracted offset value: {offset_value}")
-                except ValueError:
-                    self._query_parse_result.unsupported_clauses.append(
-                        f"OFFSET {offset_text} (needs an integer literal)"
-                    )
-            return self.visitChildren(ctx)
-        except Exception as e:
-            _logger.warning(f"Error processing OFFSET clause: {e}")
-            return self.visitChildren(ctx)
+        """Handle OFFSET: a non-negative integer literal or a bound parameter."""
+        from .where_tree import is_param, operand
+
+        if hasattr(ctx, "exprSelect") and ctx.exprSelect():
+            try:
+                value = operand(ctx.exprSelect())
+            except Exception:
+                value = None
+            if is_param(value) or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+                self._query_parse_result.offset_value = value
+            else:
+                # Dropping it would return every row
+                text = ctx.exprSelect().getText()
+                self._query_parse_result.unsupported_clauses.append(
+                    f"OFFSET {text} (needs a non-negative integer or a parameter)"
+                )
+        return None
 
     def visitUpdateClause(self, ctx: PartiQLParser.UpdateClauseContext) -> Any:
         """Handle UPDATE clause to extract collection/table name."""

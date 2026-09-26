@@ -121,9 +121,14 @@ class TestParameters:
         p = plan("SELECT g, COUNT(*) AS n FROM t WHERE a = '?' AND b = ? GROUP BY g")
         assert '"a": "?"' in p.aggregate_pipeline and '"$pymongosqlParam"' in p.aggregate_pipeline
 
-    def test_limit_parameter_raises_instead_of_returning_everything(self):
+    def test_limit_and_offset_parameters_are_kept(self):
+        p = plan("SELECT _id FROM t WHERE a = ? LIMIT ? OFFSET ?")
+        assert (p.filter_stage, p.limit_stage, p.skip_stage) == ({"a": PARAM}, PARAM, PARAM)
+
+    @pytest.mark.parametrize("clause", ["LIMIT -1", "LIMIT 'x'", "OFFSET 1.5", "LIMIT a"])
+    def test_invalid_limit_or_offset_raises_instead_of_returning_everything(self, clause):
         with pytest.raises(Error):
-            plan("SELECT _id FROM t LIMIT ?")
+            plan(f"SELECT _id FROM t {clause}")
 
     @needs_sqlalchemy
     def test_sqlalchemy_limit_and_offset_are_literals(self):
@@ -261,6 +266,18 @@ class TestLiveSelect:
     )
     def test_rows(self, docs, sql_where, expected):
         assert ids(docs, sql_where) == expected
+
+    def test_bound_limit_offset_and_limit_zero(self, docs):
+        page = run(docs, f"SELECT _id FROM {COLLECTION} WHERE v >= ? ORDER BY _id LIMIT ? OFFSET ?", [1, 2, 1])
+        assert [r[0] for r in page.fetchall()] == [2, 3]
+        assert run(docs, f"SELECT _id FROM {COLLECTION} LIMIT 0").fetchall() == []
+        assert run(docs, f"SELECT g, COUNT(*) AS n FROM {COLLECTION} GROUP BY g LIMIT ?", [0]).fetchall() == []
+        grouped = run(docs, f"SELECT g, COUNT(*) AS n FROM {COLLECTION} GROUP BY g ORDER BY g LIMIT ? OFFSET ?", [1, 1])
+        assert [tuple(r) for r in grouped.fetchall()] == [("b", 2)]
+        with pytest.raises(Error):
+            run(docs, f"SELECT _id FROM {COLLECTION} LIMIT ?", [-1])
+        with pytest.raises(Error):
+            run(docs, f"SELECT _id FROM {COLLECTION} WHERE v = ?", [1, 2])
 
     def test_count_distinct_and_having(self, docs):
         rows = run(

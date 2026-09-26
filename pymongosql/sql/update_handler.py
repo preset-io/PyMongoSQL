@@ -133,15 +133,27 @@ class UpdateHandler(BaseHandler):
             field_name = None
             field_value = None
 
-            # Extract field name from pathSimple
+            # Extract field name from pathSimple ("my field" -> my field, a[0] -> a.0)
             if hasattr(ctx, "pathSimple") and ctx.pathSimple():
-                field_name = ctx.pathSimple().getText()
+                from .handler import ContextUtilsMixin
 
-            # Extract value from expr
+                field_name = ContextUtilsMixin.normalize_field_path(ctx.pathSimple().getText())
+
+            # Extract value from expr: a literal, value function or parameter marker, read
+            # from the parse tree so a string literal '?' stays a string
             if hasattr(ctx, "expr") and ctx.expr():
-                expr_text = ctx.expr().getText()
-                # Parse the expression to get the actual value
-                field_value = self._parse_value(expr_text)
+                from ..error import NotSupportedError
+                from .where_tree import _coerce, _Field, operand
+
+                try:
+                    field_value = operand(ctx.expr())
+                except NotSupportedError:
+                    field_value = self._parse_value(ctx.expr().getText())
+                    if field_value == "?":
+                        raise
+                if isinstance(field_value, _Field):
+                    raise NotSupportedError(f"SET needs a value, not a column: {ctx.getText()}")
+                field_value = _coerce(field_value, as_double=True)  # a fractional literal is stored as a double
 
             return field_name, field_value
         except Exception as e:

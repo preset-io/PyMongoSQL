@@ -154,17 +154,6 @@ class SQLHelper:
         return bound, idx[0]
 
     @staticmethod
-    def count_placeholders(value: Any) -> int:
-        """Number of legacy "?" placeholders (INSERT values, UPDATE SET) in a structure."""
-        if isinstance(value, str):
-            return int(value == "?")
-        if isinstance(value, dict):
-            return sum(SQLHelper.count_placeholders(v) for v in value.values())
-        if isinstance(value, list):
-            return sum(SQLHelper.count_placeholders(v) for v in value)
-        return 0
-
-    @staticmethod
     def replace_placeholders_generic(value: Any, parameters: Any, style: Optional[str]) -> Any:
         """Recursively replace placeholders in nested structures for qmark or named styles."""
         if style is None or parameters is None:
