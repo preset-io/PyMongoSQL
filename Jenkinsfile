@@ -43,6 +43,8 @@ podTemplate(
                 env.KEY = "pymongosql/${env.WHEEL}"
                 sh '''
                     set -eu
+                    # The checkout is owned by another uid; setuptools_scm runs git during builds.
+                    export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=safe.directory GIT_CONFIG_VALUE_0="$PWD"
                     .venv/bin/pip install --no-deps -e .
                     for attempt in $(seq 1 30); do
                         .venv/bin/python -c "import pymongo; pymongo.MongoClient('mongodb://admin:secret@localhost:27017', serverSelectionTimeoutMS=2000).admin.command('ping')" && break
