@@ -34,6 +34,14 @@ class QueryParseResult:
 
     # SQL aggregate functions detected in SELECT (COUNT, SUM, AVG, MIN, MAX)
     aggregate_functions: List[Dict[str, Any]] = field(default_factory=list)
+    # SELECT items in order: {"field": name, "alias": alias} or {"aggregate": index}
+    select_items: List[Dict[str, Any]] = field(default_factory=list)
+    # GROUP BY field paths
+    group_by: List[str] = field(default_factory=list)
+    # Clauses that are parsed but cannot be translated faithfully
+    unsupported_clauses: List[str] = field(default_factory=list)
+    # FROM alias (FROM users AS u / FROM users u)
+    collection_alias: Optional[str] = None
 
     # Subquery info (for wrapped subqueries, e.g., Superset outering)
     subquery_plan: Optional[Any] = None
@@ -137,15 +145,18 @@ class SelectHandler(BaseHandler, ContextUtilsMixin):
                 if agg_match:
                     func_name = agg_match.group(1).upper()
                     func_arg = agg_match.group(2)
+                    parse_result.select_items.append({"aggregate": len(parse_result.aggregate_functions)})
                     parse_result.aggregate_functions.append(
                         {
                             "function": func_name,
                             "argument": func_arg,
                             "alias": alias or field_name,
+                            "expression": field_name,
                         }
                     )
                     continue
 
+                parse_result.select_items.append({"field": field_name, "alias": alias})
                 # Use MongoDB standard projection format: {field: 1} to include field
                 projection[field_name] = 1
                 # Store alias if present
@@ -182,7 +193,7 @@ class SelectHandler(BaseHandler, ContextUtilsMixin):
                 # Pattern: expr symbolPrimitive (without AS)
                 alias = item.children[1].getText()
 
-        return field_name, alias
+        return field_name, self.unquote_identifier(alias)
 
 
 class FromHandler(BaseHandler):
@@ -260,6 +271,35 @@ class FromHandler(BaseHandler):
             _logger.debug(f"Error parsing function call: {e}")
             return None
 
+    @staticmethod
+    def _collection_reference(table_ref: Any) -> Tuple[Optional[str], Optional[str], Optional[str]]:
+        """Return (collection text, alias, problem) for a FROM table reference.
+
+        Only a single collection, optionally aliased, can be translated. Joins, subqueries
+        and AT/BY bindings are reported as a problem so the query fails instead of reading
+        a collection named after the whole clause.
+        """
+        if not hasattr(table_ref, "getRuleIndex"):
+            return table_ref.getText(), None, None  # not a parse-tree node: a plain name
+        while isinstance(table_ref, PartiQLParser.TableWrappedContext):
+            table_ref = table_ref.tableReference()
+        if not isinstance(table_ref, PartiQLParser.TableRefBaseContext):
+            return None, None, "FROM with a join"
+        base = table_ref.tableNonJoin().tableBaseReference()
+        if isinstance(base, PartiQLParser.TableBaseRefSymbolContext):
+            source, alias = base.source, base.symbolPrimitive().getText()
+        elif isinstance(base, PartiQLParser.TableBaseRefClausesContext):
+            if base.atIdent() is not None or base.byIdent() is not None:
+                return None, None, "FROM ... AT/BY"
+            source = base.source
+            alias = base.asIdent().symbolPrimitive().getText() if base.asIdent() is not None else None
+        else:
+            return None, None, "FROM with UNPIVOT or a graph match"
+        text = source.getText()
+        if text.startswith("("):
+            return None, None, "FROM a subquery (use mode=superset)"
+        return text, alias, None
+
     def handle_visitor(self, ctx: PartiQLParser.FromClauseContext, parse_result: "QueryParseResult") -> Any:
         """Handle FROM clause - detect aggregate calls or regular collections"""
         if hasattr(ctx, "tableReference") and ctx.tableReference():
@@ -282,12 +322,16 @@ class FromHandler(BaseHandler):
                 _logger.info(f"Parsed aggregate call: collection={func_info['collection']}")
                 return func_info
 
-            # Regular collection reference
-            table_text = ctx.tableReference().getText()
+            # Regular collection reference, optionally aliased
+            source, alias, problem = self._collection_reference(ctx.tableReference())
+            if problem:
+                parse_result.unsupported_clauses.append(problem)
+                return None
             # Strip surrounding quotes from collection name (e.g., "user.accounts" -> user.accounts)
-            collection_name = self._strip_collection_quotes(table_text)
+            collection_name = self._strip_collection_quotes(source)
             parse_result.collection = collection_name
-            _logger.debug(f"Parsed regular collection: {collection_name}")
+            parse_result.collection_alias = ContextUtilsMixin.unquote_identifier(alias) if alias else None
+            _logger.debug(f"Parsed regular collection: {collection_name} (alias {alias})")
             return collection_name
 
         return None
@@ -305,16 +349,15 @@ class WhereHandler(BaseHandler):
 
     def handle_visitor(self, ctx: PartiQLParser.WhereClauseSelectContext, parse_result: "QueryParseResult") -> Any:
         if hasattr(ctx, "exprSelect") and ctx.exprSelect():
+            from .where_tree import WhereTreeBuilder
+
+            # Translate over the parse tree with SQL three-valued logic. A clause that
+            # cannot be translated fails the query; it never falls back to a partial
+            # or text-search filter that would return different rows.
             try:
-                # Use enhanced expression handler for better parsing
-                filter_conditions = self._expression_handler.handle(ctx)
-                parse_result.filter_conditions = filter_conditions
-                return filter_conditions
+                parse_result.filter_conditions = WhereTreeBuilder().build(ctx.exprSelect())
             except Exception as e:
-                _logger.warning(f"Failed to parse WHERE expression, falling back to text search: {e}")
-                # Fallback to simple text search
-                filter_text = ctx.exprSelect().getText()
-                fallback_filter = {"$text": {"$search": filter_text}}
-                parse_result.filter_conditions = fallback_filter
-                return fallback_filter
+                parse_result.unsupported_clauses.append(f"WHERE ({e})")
+                parse_result.filter_conditions = {}
+            return parse_result.filter_conditions
         return {}

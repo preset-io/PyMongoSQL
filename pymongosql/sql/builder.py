@@ -111,18 +111,70 @@ class ExecutionPlanBuilder:
             return ExecutionPlanBuilder._build_query_plan(parse_result)
 
     @staticmethod
+    def _strip_collection_qualifier(parse_result: "QueryParseResult") -> None:
+        """Resolve ``collection.field`` references to ``field``.
+
+        SQL qualifies a column with the table it belongs to, while MongoDB reads a
+        dotted name as an embedded-document path. Without this, a qualified
+        reference such as ``users.name`` reads the missing path ``users.name``
+        and silently returns NULL. As in SQL, the collection name takes
+        precedence over an embedded document of the same name.
+        """
+        collection = parse_result.collection
+        if not collection:
+            return
+        # With FROM users AS u, u.name is the column name; so is users.name
+        prefixes = [f"{q}." for q in (parse_result.collection_alias, collection) if q]
+
+        def strip(name: Any) -> Any:
+            for prefix in prefixes:
+                if isinstance(name, str) and name.startswith(prefix) and len(name) > len(prefix):
+                    return name[len(prefix) :]
+            return name
+
+        def strip_filter(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {strip(k): strip_filter(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [strip_filter(v) for v in value]
+            return value
+
+        parse_result.projection = {strip(k): v for k, v in parse_result.projection.items()}
+        parse_result.column_aliases = {strip(k): v for k, v in parse_result.column_aliases.items()}
+        parse_result.sort_fields = [{strip(k): v for k, v in spec.items()} for spec in parse_result.sort_fields]
+        parse_result.filter_conditions = strip_filter(parse_result.filter_conditions)
+        for func_info in parse_result.aggregate_functions:
+            func_info["argument"] = strip(func_info["argument"])
+        parse_result.group_by = [strip(name) for name in parse_result.group_by]
+        for item in parse_result.select_items:
+            if "field" in item:
+                item["field"] = strip(item["field"])
+
+    @staticmethod
     def _build_query_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":
         """Build a query execution plan from SELECT parsing."""
+        from ..error import NotSupportedError
 
-        # Auto-generate aggregate pipeline for SQL aggregate functions (COUNT, SUM, etc.)
-        if getattr(parse_result, "aggregate_functions", None):
+        ExecutionPlanBuilder._strip_collection_qualifier(parse_result)
+        if parse_result.unsupported_clauses:
+            raise NotSupportedError(f"Unsupported SQL clause: {', '.join(parse_result.unsupported_clauses)}")
+
+        # Auto-generate aggregate pipeline for SQL aggregate functions (COUNT, SUM, etc.) and GROUP BY
+        if parse_result.aggregate_functions or parse_result.group_by:
             return ExecutionPlanBuilder._build_sql_aggregate_plan(parse_result)
+
+        # ORDER BY may name a column by its SELECT alias; find() sorts on the field
+        field_for_alias = {alias: name for name, alias in parse_result.column_aliases.items()}
+        sort_fields = [
+            {field_for_alias.get(name, name): direction for name, direction in spec.items()}
+            for spec in parse_result.sort_fields
+        ]
 
         builder = BuilderFactory.create_query_builder().collection(parse_result.collection)
 
         builder.filter(parse_result.filter_conditions).project(parse_result.projection).column_aliases(
             parse_result.column_aliases
-        ).sort(parse_result.sort_fields).limit(parse_result.limit_value).skip(parse_result.offset_value)
+        ).sort(sort_fields).limit(parse_result.limit_value).skip(parse_result.offset_value)
 
         # Set aggregate flags BEFORE building (needed for validation)
         if hasattr(parse_result, "is_aggregate_query") and parse_result.is_aggregate_query:
@@ -136,7 +188,14 @@ class ExecutionPlanBuilder:
 
     @staticmethod
     def _build_sql_aggregate_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":
-        """Build an aggregate execution plan from SQL aggregate functions like COUNT(*), SUM(), etc."""
+        """Build an aggregate execution plan from SQL aggregate functions and GROUP BY.
+
+        Pipeline: $match (WHERE), $group (GROUP BY keys as _id, one accumulator per
+        aggregate), $project (SELECT list, in order, under its output names), then
+        $sort, $skip and $limit on those output names.
+        """
+        from ..error import NotSupportedError
+
         _FUNCTION_TO_ACCUMULATOR = {
             "COUNT": "$sum",
             "SUM": "$sum",
@@ -153,37 +212,72 @@ class ExecutionPlanBuilder:
         if parse_result.filter_conditions:
             pipeline.append({"$match": parse_result.filter_conditions})
 
-        # Build $group stage from aggregate functions
-        group_stage = {"_id": None}
-        for func_info in parse_result.aggregate_functions:
-            alias = func_info["alias"]
+        group_keys = {name: f"g{i}" for i, name in enumerate(parse_result.group_by)}
+        group_stage = {"_id": {key: f"${name}" for name, key in group_keys.items()} if group_keys else None}
+        accumulator_keys = []
+        for i, func_info in enumerate(parse_result.aggregate_functions):
             func_name = func_info["function"]
             arg = func_info["argument"]
             accumulator = _FUNCTION_TO_ACCUMULATOR[func_name]
+            # $group output names may not contain "." or start with "$", nor repeat
+            key = func_info["alias"]
+            if "." in key or key.startswith("$") or key == "_id" or key in group_stage:
+                key = f"__agg{i}"
+            accumulator_keys.append(key)
 
-            if func_name == "COUNT":
-                group_stage[alias] = {accumulator: 1}
+            if func_name == "COUNT" and arg == "*":
+                group_stage[key] = {accumulator: 1}
+            elif func_name == "COUNT":
+                # COUNT(field) counts documents where the field is present and not null
+                group_stage[key] = {"$sum": {"$cond": [{"$gt": [f"${arg}", None]}, 1, 0]}}
             else:
-                group_stage[alias] = {accumulator: f"${arg}"}
+                group_stage[key] = {accumulator: f"${arg}"}
 
         pipeline.append({"$group": group_stage})
 
-        # Add $project to exclude _id
+        # Map every SELECT item, in order, to its output name and source
         project_stage = {"_id": 0}
-        for func_info in parse_result.aggregate_functions:
-            project_stage[func_info["alias"]] = 1
+        outputs = []
+        output_for = {}  # names ORDER BY may use -> output name
+        for item in parse_result.select_items:
+            if "aggregate" in item:
+                func_info = parse_result.aggregate_functions[item["aggregate"]]
+                output, key = func_info["alias"], accumulator_keys[item["aggregate"]]
+                source = 1 if key == output else f"${key}"
+                output_for[func_info["expression"].upper()] = output
+            else:
+                name = item["field"]
+                if name not in group_keys:
+                    raise NotSupportedError(f"Column '{name}' must appear in GROUP BY or in an aggregate function")
+                output, source = item["alias"] or name, f"$_id.{group_keys[name]}"
+                output_for[name] = output
+            output_for[output] = output
+            project_stage[output] = source
+            outputs.append(output)
         pipeline.append({"$project": project_stage})
+
+        sort_stage = {}
+        for spec in parse_result.sort_fields:
+            for name, direction in spec.items():
+                output = output_for.get(name, output_for.get(name.upper()))
+                if output is None:
+                    raise NotSupportedError(f"ORDER BY '{name}' must name a selected column or its alias")
+                sort_stage[output] = direction
+        if sort_stage:
+            pipeline.append({"$sort": sort_stage})
+        if parse_result.offset_value:
+            pipeline.append({"$skip": parse_result.offset_value})
+        if parse_result.limit_value is not None:
+            pipeline.append({"$limit": parse_result.limit_value})
 
         # Configure the execution plan as an aggregate query
         builder._execution_plan.is_aggregate_query = True
+        builder._execution_plan.aggregate_parameterized = True
         builder._execution_plan.aggregate_pipeline = json.dumps(pipeline)
         builder._execution_plan.aggregate_options = json.dumps({})
 
-        # Set projection for ResultSet description
-        agg_projection = {}
-        for func_info in parse_result.aggregate_functions:
-            agg_projection[func_info["alias"]] = 1
-        builder._execution_plan.projection_stage = agg_projection
+        # Set projection for ResultSet description, in SELECT order
+        builder._execution_plan.projection_stage = {name: 1 for name in outputs}
 
         plan = builder.build()
         return plan
@@ -212,6 +306,11 @@ class ExecutionPlanBuilder:
     @staticmethod
     def _build_delete_plan(parse_result: "DeleteParseResult") -> "DeleteExecutionPlan":
         """Build a DELETE execution plan from DELETE parsing."""
+        from ..error import SqlSyntaxError
+
+        if parse_result.has_errors:
+            # An untranslated WHERE must never become an empty filter (every document)
+            raise SqlSyntaxError(parse_result.error_message or "DELETE parsing failed")
         _logger.debug(
             f"Building DELETE plan with collection: {parse_result.collection}, "
             f"filters: {parse_result.filter_conditions}"
@@ -226,6 +325,11 @@ class ExecutionPlanBuilder:
     @staticmethod
     def _build_update_plan(parse_result: "UpdateParseResult") -> "UpdateExecutionPlan":
         """Build an UPDATE execution plan from UPDATE parsing."""
+        from ..error import SqlSyntaxError
+
+        if parse_result.has_errors:
+            # An untranslated WHERE must never become an empty filter (every document)
+            raise SqlSyntaxError(parse_result.error_message or "UPDATE parsing failed")
         _logger.debug(
             f"Building UPDATE plan with collection: {parse_result.collection}, "
             f"update_fields: {parse_result.update_fields}, "

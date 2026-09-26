@@ -232,6 +232,10 @@ class StandardQueryExecution(ExecutionStrategy):
             _logger.debug(f"Pipeline: {pipeline}")
             _logger.debug(f"Options: {options}")
 
+            # A pipeline generated from SQL carries the WHERE clause's ? placeholders
+            if parameters and execution_plan.aggregate_parameterized:
+                pipeline = self._replace_placeholders(pipeline, parameters)
+
             # Get collection and call aggregate()
             collection = db[execution_plan.collection]
 

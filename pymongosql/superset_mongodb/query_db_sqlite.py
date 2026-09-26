@@ -7,6 +7,12 @@ from .query_db import QueryDatabase
 
 _logger = logging.getLogger(__name__)
 
+# SQLite has no boolean type. Boolean columns are declared with this private type
+# (NUMERIC affinity, stored as 0/1) and converted back to bool when a query selects
+# the column itself; expressions over it (SUM, CASE, ...) keep their numeric result.
+BOOLEAN_DECLTYPE = "PYMONGOSQL_BOOL"
+sqlite3.register_converter(BOOLEAN_DECLTYPE, lambda raw: int(raw) != 0)
+
 
 class SQLiteTypeMapper:
     """Maps Python/MongoDB data types to SQLite3 types"""
@@ -16,7 +22,7 @@ class SQLiteTypeMapper:
         str: "TEXT",
         int: "INTEGER",
         float: "REAL",
-        bool: "INTEGER",  # SQLite3 uses 0/1 for boolean
+        bool: BOOLEAN_DECLTYPE,  # stored as 0/1, read back as bool
         bytes: "BLOB",
         type(None): "NULL",
         dict: "TEXT",  # Store as JSON string
@@ -51,15 +57,14 @@ class SQLiteTypeMapper:
 
         for record in records:
             for col_name, value in record.items():
-                if col_name not in schema:
-                    # First occurrence, determine type
-                    schema[col_name] = cls.get_sqlite_type(value)
-                elif schema[col_name] != "TEXT":
-                    # If we've already determined type, check compatibility
-                    new_type = cls.get_sqlite_type(value)
+                new_type = cls.get_sqlite_type(value)
+                current = schema.get(col_name, "NULL")
+                if current == "NULL":
+                    # First non-null value determines the type; NULL fits every type
+                    schema[col_name] = new_type
+                elif new_type not in ("NULL", current):
                     # Upgrade to TEXT if types differ (safest option)
-                    if new_type != schema[col_name]:
-                        schema[col_name] = "TEXT"
+                    schema[col_name] = "TEXT"
 
         return schema
 
@@ -69,7 +74,7 @@ class SQLiteTypeMapper:
         if value is None:
             return None
 
-        if target_type == "INTEGER":
+        if target_type in ("INTEGER", BOOLEAN_DECLTYPE):
             return int(value) if value is not None else None
         elif target_type == "REAL":
             return float(value) if value is not None else None
@@ -107,7 +112,7 @@ class QueryDBSQLite(QueryDatabase):
 
         if self._connection is None:
             # Create in-memory database
-            self._connection = sqlite3.connect(":memory:")
+            self._connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
             # Enable row factory to get dict-like rows
             self._connection.row_factory = sqlite3.Row
             _logger.debug("Created in-memory SQLite3 database")

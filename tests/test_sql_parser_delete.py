@@ -67,7 +67,7 @@ class TestSQLParserDelete:
 
         assert isinstance(plan, DeleteExecutionPlan)
         assert plan.collection == "temp"
-        assert plan.filter_conditions == {"valid": {"$ne": True}}
+        assert plan.filter_conditions == {"valid": {"$nin": [True, None]}}
 
     def test_delete_with_qmark_parameter(self):
         """Test DELETE with qmark placeholder."""

@@ -4,7 +4,7 @@ from typing import Any, Dict, Union
 
 from ..error import SqlSyntaxError
 from .delete_handler import DeleteParseResult
-from .handler import BaseHandler, HandlerFactory
+from .handler import BaseHandler, ContextUtilsMixin, HandlerFactory
 from .insert_handler import InsertParseResult
 from .partiql.PartiQLLexer import PartiQLLexer
 from .partiql.PartiQLParser import PartiQLParser
@@ -275,6 +275,7 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
             if hasattr(ctx, "orderSortSpec") and ctx.orderSortSpec():
                 for sort_spec in ctx.orderSortSpec():
                     field_name = sort_spec.expr().getText() if sort_spec.expr() else "_id"
+                    field_name = ContextUtilsMixin.normalize_field_path(field_name)
                     # Check for ASC/DESC (default is ASC = 1)
                     direction = 1  # ASC
                     if hasattr(sort_spec, "DESC") and sort_spec.DESC():
@@ -288,6 +289,23 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
         except Exception as e:
             _logger.warning(f"Error processing ORDER BY clause: {e}")
             return self.visitChildren(ctx)
+
+    def visitGroupClause(self, ctx: PartiQLParser.GroupClauseContext) -> Any:
+        """Handle GROUP BY keys; they become the _id of a $group stage."""
+        keys = []
+        for key in ctx.groupKey() or []:
+            if key.symbolPrimitive() is not None:
+                self._query_parse_result.unsupported_clauses.append("GROUP BY key alias")
+            keys.append(ContextUtilsMixin.normalize_field_path(key.exprSelect().getText()))
+        if ctx.PARTIAL() is not None:
+            self._query_parse_result.unsupported_clauses.append("GROUP PARTIAL BY")
+        self._query_parse_result.group_by = keys
+        return None
+
+    def visitHavingClause(self, ctx: PartiQLParser.HavingClauseContext) -> Any:
+        """HAVING is not translated; record it so the query fails instead of ignoring it."""
+        self._query_parse_result.unsupported_clauses.append("HAVING")
+        return None
 
     def visitLimitClause(self, ctx: PartiQLParser.LimitClauseContext) -> Any:
         """Handle LIMIT clause for result limiting"""

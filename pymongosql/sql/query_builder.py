@@ -22,6 +22,8 @@ class QueryExecutionPlan(ExecutionPlan):
     aggregate_pipeline: Optional[str] = None  # JSON string representation of pipeline
     aggregate_options: Optional[str] = None  # JSON string representation of options
     is_aggregate_query: bool = False  # Flag indicating this is an aggregate() call
+    # True when the pipeline was generated from SQL and may hold ? placeholders
+    aggregate_parameterized: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert query plan to dictionary representation"""
@@ -76,6 +78,7 @@ class QueryExecutionPlan(ExecutionPlan):
             aggregate_pipeline=self.aggregate_pipeline,
             aggregate_options=self.aggregate_options,
             is_aggregate_query=self.is_aggregate_query,
+            aggregate_parameterized=self.aggregate_parameterized,
         )
 
 

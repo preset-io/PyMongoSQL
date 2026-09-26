@@ -190,6 +190,11 @@ class UpdateHandler(BaseHandler):
 
             if expression_ctx:
                 from .handler import HandlerFactory
+                from .where_tree import WhereTreeBuilder
+
+                if expression_ctx is not None:
+                    parse_result.filter_conditions = WhereTreeBuilder().build(expression_ctx)
+                    return parse_result.filter_conditions
 
                 handler = HandlerFactory.get_expression_handler(expression_ctx)
 
