@@ -33,7 +33,7 @@ podTemplate(
                     python -m venv .venv
                     .venv/bin/pip install 'sqlalchemy==2.0.52' 'pymongo==4.17.0' \
                         'antlr4-python3-runtime==4.13.2' 'jmespath==1.1.0' 'pandas>=2.2,<3' \
-                        'tenacity==9.1.2' 'pytest==8.3.5' 'boto3>=1.36,<2' 'packaging==25.0' \
+                        'tenacity==9.1.2' 'sqlglot==30.18.0' 'pytest==8.3.5' 'boto3>=1.36,<2' 'packaging==25.0' \
                         'build==1.4.4' 'setuptools==80.9.0' 'setuptools_scm==8.3.1' 'wheel==0.45.1'
                 '''
                 def version = sh(script: ".venv/bin/python ci/release_version.py ${args}",

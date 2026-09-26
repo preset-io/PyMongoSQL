@@ -36,8 +36,10 @@ class QueryParseResult:
     aggregate_functions: List[Dict[str, Any]] = field(default_factory=list)
     # SELECT items in order: {"field": name, "alias": alias} or {"aggregate": index}
     select_items: List[Dict[str, Any]] = field(default_factory=list)
-    # GROUP BY field paths
+    # GROUP BY field paths (or the text of a computed expression, see ``computed``)
     group_by: List[str] = field(default_factory=list)
+    # Computed expressions by their SQL text: {"unit": ..., "field": ...} for DATE_TRUNC
+    computed: Dict[str, Dict[str, str]] = field(default_factory=dict)
     # Clauses that are parsed but cannot be translated faithfully
     unsupported_clauses: List[str] = field(default_factory=list)
     # FROM alias (FROM users AS u / FROM users u)
@@ -156,6 +158,10 @@ class SelectHandler(BaseHandler, ContextUtilsMixin):
                         }
                     )
                     continue
+                if kind == "computed":
+                    parse_result.computed[field_name] = detail
+                    parse_result.select_items.append({"computed": field_name, "alias": alias})
+                    continue
                 if kind == "unsupported":
                     # e.g. a + 1 or lower(a): projecting it as a field would silently read NULL
                     parse_result.unsupported_clauses.append(f"SELECT {detail}")
@@ -174,6 +180,25 @@ class SelectHandler(BaseHandler, ContextUtilsMixin):
         return projection
 
     _AGGREGATES = ("COUNT", "SUM", "AVG", "MIN", "MAX")
+
+    @staticmethod
+    def date_trunc(node: Any) -> Optional[Dict[str, str]]:
+        """{"unit", "field"} for DATE_TRUNC('<unit>', <field>), else None."""
+        from ..superset_mongodb.time_grain import UNITS
+        from .where_tree import _PATH_NODES, _field_path, _string_literal, _unwrap
+
+        node = _unwrap(node)
+        if not isinstance(node, PartiQLParser.FunctionCallContext):
+            return None
+        if node.functionName().getText().lower() != "date_trunc" or len(node.expr()) != 2:
+            return None
+        unit, target = _unwrap(node.expr()[0]), _unwrap(node.expr()[1])
+        if not isinstance(unit, PartiQLParser.LiteralStringContext) or not isinstance(target, _PATH_NODES):
+            raise ValueError(f"DATE_TRUNC needs a unit literal and a field: {node.getText()}")
+        name = _string_literal(unit.getText()).lower()
+        if name not in UNITS:
+            raise ValueError(f"Unsupported DATE_TRUNC unit {name!r}; use one of {', '.join(UNITS)}")
+        return {"unit": name, "field": _field_path(target)}
 
     @staticmethod
     def _classify_item(item) -> Tuple[str, Any]:
@@ -199,8 +224,11 @@ class SelectHandler(BaseHandler, ContextUtilsMixin):
                 return "aggregate", (func, _field_path(argument), distinct)
             if isinstance(node, _PATH_NODES):
                 return "field", _field_path(node)
-        except Exception:
-            pass
+            truncated = SelectHandler.date_trunc(node)
+            if truncated is not None:
+                return "computed", truncated
+        except Exception as e:
+            return "unsupported", f"{node.getText()} ({e})"
         return "unsupported", node.getText()
 
     def _extract_field_and_alias(self, item) -> Tuple[str, Optional[str]]:

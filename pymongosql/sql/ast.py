@@ -9,7 +9,7 @@ from .insert_handler import InsertParseResult
 from .partiql.PartiQLLexer import PartiQLLexer
 from .partiql.PartiQLParser import PartiQLParser
 from .partiql.PartiQLParserVisitor import PartiQLParserVisitor
-from .query_handler import QueryParseResult
+from .query_handler import QueryParseResult, SelectHandler
 from .update_handler import UpdateParseResult
 
 _logger = logging.getLogger(__name__)
@@ -296,7 +296,15 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
         for key in ctx.groupKey() or []:
             if key.symbolPrimitive() is not None:
                 self._query_parse_result.unsupported_clauses.append("GROUP BY key alias")
-            keys.append(ContextUtilsMixin.normalize_field_path(key.exprSelect().getText()))
+            text = ContextUtilsMixin.normalize_field_path(key.exprSelect().getText())
+            try:
+                truncated = SelectHandler.date_trunc(key.exprSelect())
+            except ValueError as e:
+                self._query_parse_result.unsupported_clauses.append(f"GROUP BY {text} ({e})")
+                truncated = None
+            if truncated is not None:
+                self._query_parse_result.computed[text] = truncated
+            keys.append(text)
         if ctx.PARTIAL() is not None:
             self._query_parse_result.unsupported_clauses.append("GROUP PARTIAL BY")
         self._query_parse_result.group_by = keys

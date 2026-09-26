@@ -2,7 +2,7 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from bson import json_util
 
@@ -148,6 +148,8 @@ class ExecutionPlanBuilder:
         for func_info in parse_result.aggregate_functions:
             func_info["argument"] = strip(func_info["argument"])
         parse_result.group_by = [strip(name) for name in parse_result.group_by]
+        for expression in parse_result.computed.values():
+            expression["field"] = strip(expression["field"])
         for item in parse_result.select_items:
             if "field" in item:
                 item["field"] = strip(item["field"])
@@ -164,6 +166,8 @@ class ExecutionPlanBuilder:
         # Auto-generate aggregate pipeline for SQL aggregate functions (COUNT, SUM, etc.), GROUP BY and HAVING
         if parse_result.aggregate_functions or parse_result.group_by or parse_result.having is not None:
             return ExecutionPlanBuilder._build_sql_aggregate_plan(parse_result)
+        if any("computed" in item for item in parse_result.select_items):
+            return ExecutionPlanBuilder._build_computed_plan(parse_result)
 
         # ORDER BY may name a column by its SELECT alias; find() sorts on the field
         field_for_alias = {alias: name for name, alias in parse_result.column_aliases.items()}
@@ -187,6 +191,54 @@ class ExecutionPlanBuilder:
         # Now build and validate
         plan = builder.build()
         return plan
+
+    @staticmethod
+    def _build_computed_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":
+        """A SELECT with computed columns (DATE_TRUNC) and no grouping.
+
+        Pipeline: $match (WHERE), $addFields (computed columns), $sort, then $project of
+        the SELECT list in order; OFFSET/LIMIT are applied after binding.
+        """
+        from ..superset_mongodb.time_grain import mongo_expression
+
+        builder = BuilderFactory.create_query_builder().collection(parse_result.collection)
+        pipeline: List[Dict[str, Any]] = []
+        if parse_result.filter_conditions:
+            pipeline.append({"$match": parse_result.filter_conditions})
+        added: Dict[str, Any] = {}
+        project: Dict[str, Any] = {}
+        sources: Dict[str, str] = {}  # names ORDER BY may use -> sortable field
+        outputs = []
+        for index, item in enumerate(parse_result.select_items):
+            if "computed" in item:
+                expression = parse_result.computed[item["computed"]]
+                hidden = f"__computed{index}"
+                added[hidden] = mongo_expression(expression["unit"], expression["field"])
+                source, text = hidden, item["computed"]
+            else:
+                source = text = item["field"]
+            output = item["alias"] or text
+            project[output] = f"${source}"
+            sources[output] = sources[text] = sources[text.upper()] = source
+            outputs.append(output)
+        if "_id" not in project:
+            project["_id"] = 0
+        if added:
+            pipeline.append({"$addFields": added})
+        sort = {}
+        for spec in parse_result.sort_fields:
+            for name, direction in spec.items():
+                sort[sources.get(name, sources.get(name.upper(), name))] = direction
+        if sort:
+            pipeline.append({"$sort": sort})
+        pipeline.append({"$project": project})
+        builder.skip(parse_result.offset_value).limit(parse_result.limit_value)
+        builder._execution_plan.is_aggregate_query = True
+        builder._execution_plan.aggregate_parameterized = True
+        builder._execution_plan.aggregate_pipeline = json_util.dumps(pipeline)
+        builder._execution_plan.aggregate_options = json.dumps({})
+        builder._execution_plan.projection_stage = {name: 1 for name in outputs}
+        return builder.build()
 
     @staticmethod
     def _aggregate_source(func_info: Dict[str, Any], key: str) -> Any:
@@ -280,8 +332,15 @@ class ExecutionPlanBuilder:
         if parse_result.filter_conditions:
             pipeline.append({"$match": parse_result.filter_conditions})
 
+        from ..superset_mongodb.time_grain import mongo_expression
+
         group_keys = {name: f"g{i}" for i, name in enumerate(parse_result.group_by)}
-        group_stage = {"_id": {key: f"${name}" for name, key in group_keys.items()} if group_keys else None}
+
+        def key_source(name: str) -> Any:
+            computed = parse_result.computed.get(name)
+            return mongo_expression(computed["unit"], computed["field"]) if computed else f"${name}"
+
+        group_stage = {"_id": {key: key_source(name) for name, key in group_keys.items()} if group_keys else None}
 
         # HAVING may name select-list outputs, grouped columns or aggregates; the ones
         # not in the SELECT list are computed as hidden outputs and removed afterwards.
@@ -325,7 +384,7 @@ class ExecutionPlanBuilder:
                 source = 1 if key == output else ExecutionPlanBuilder._aggregate_source(func_info, key)
                 output_for[func_info["expression"].upper()] = output
             else:
-                name = item["field"]
+                name = item.get("field") or item["computed"]
                 if name not in group_keys:
                     raise NotSupportedError(f"Column '{name}' must appear in GROUP BY or in an aggregate function")
                 output, source = item["alias"] or name, f"$_id.{group_keys[name]}"
