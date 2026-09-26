@@ -56,7 +56,7 @@ class TestPlans:
             "SELECT _id FROM t WHERE NOT lower(b) = 'x'",
             "SELECT _id FROM t WHERE lower(b) = 'x'",
             "SELECT _id FROM t WHERE a = 1 AND lower(b) = 'x'",
-            "SELECT _id FROM t WHERE b LIKE ?",
+            "SELECT _id FROM t WHERE b LIKE 1",
         ],
     )
     def test_untranslatable_where_raises_instead_of_widening(self, sql):
@@ -121,7 +121,7 @@ class TestLive:
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not available")
 class TestSQLAlchemy:
-    def test_like_pattern_is_rendered_inline(self):
+    def test_like_pattern_is_bound(self):
         import sqlalchemy as sa
 
         from pymongosql.sqlalchemy_mongodb.sqlalchemy_dialect import PyMongoSQLDialect
@@ -129,7 +129,7 @@ class TestSQLAlchemy:
         t = sa.table("t", sa.column("b"))
         stmt = sa.select(t.c.b).where(t.c.b.like("O'B%"), t.c.b.not_like("x_"))
         sql = " ".join(str(stmt.compile(dialect=PyMongoSQLDialect())).split())
-        assert sql == "SELECT b FROM t WHERE b LIKE 'O''B%' AND b NOT LIKE 'x_'"
+        assert sql == "SELECT b FROM t WHERE b LIKE ? AND b NOT LIKE ?"
 
     def test_core_not_and_like_rows(self, sqlalchemy_engine, docs):
         import sqlalchemy as sa

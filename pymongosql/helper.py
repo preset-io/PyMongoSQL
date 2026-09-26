@@ -128,20 +128,32 @@ class SQLHelper:
         a parameter the translation dropped (e.g. a LIMIT it could not read) must not
         silently widen the query. Returns the bound value and the number used.
         """
-        from .sql.where_tree import is_param
+        from .sql.where_tree import LIKE_KEY, is_like, is_param, like_operator
 
         params = [] if parameters is None else parameters
         if isinstance(params, dict) or not isinstance(params, Sequence) or isinstance(params, (str, bytes)):
             raise ProgrammingError("Positional parameters must be provided as a sequence")
         idx = [0]
 
+        def take() -> Any:
+            if idx[0] >= len(params):
+                raise ProgrammingError("Not enough parameters provided")
+            out = params[idx[0]]
+            idx[0] += 1
+            return out
+
         def replace(val: Any) -> Any:
             if is_param(val):
-                if idx[0] >= len(params):
-                    raise ProgrammingError("Not enough parameters provided")
-                out = params[idx[0]]
-                idx[0] += 1
-                return SQLHelper.to_bson_value(out)
+                return SQLHelper.to_bson_value(take())
+            if is_like(val):
+                like = val[LIKE_KEY]
+                parts = []
+                for part in like["parts"]:
+                    part = take() if is_param(part) else part
+                    if not isinstance(part, str):
+                        raise ProgrammingError(f"A LIKE pattern parameter must be a string, got {part!r}")
+                    parts.append(part)
+                return like_operator("".join(parts), like["escape"], like["i"])
             if isinstance(val, dict):
                 return {k: replace(v) for k, v in val.items()}
             if isinstance(val, list):

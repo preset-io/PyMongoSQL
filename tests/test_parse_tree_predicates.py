@@ -95,22 +95,36 @@ class TestLike:
     def test_inner_wildcards_match_newlines(self):
         assert where("n LIKE 'a%b'") == {"n": {"$regex": "^a.*b$", "$options": "s"}}
 
-    def test_bound_pattern_raises(self):
+    def test_bound_pattern_is_translated_when_bound(self):
+        from pymongosql.helper import SQLHelper
+
+        f = where("n LIKE '%' || ? || '%' ESCAPE '/'")
+        bound, used = SQLHelper.bind_filter(f, ["5/%(k)s"])
+        assert (bound, used) == ({"n": {"$regex": ".*5%\\(k\\)s.*"}}, 1)
         with pytest.raises(Error):
-            where("n LIKE ?")
+            SQLHelper.bind_filter(where("n LIKE ?"), [5])
+
+    def test_case_insensitive_like_from_lower(self):
+        assert where("lower(n) LIKE lower('A%b')") == {"n": {"$regex": "^A.*b$", "$options": "si"}}
+        assert where("lower(n) LIKE 'a%'") == {"n": {"$regex": "^a.*", "$options": "i"}}
 
     @needs_sqlalchemy
-    def test_sqlalchemy_helpers_render_translatable_patterns(self):
+    def test_sqlalchemy_helpers_translate_after_binding(self):
+        from pymongosql.helper import SQLHelper
+
         t = sa.table("t", sa.column("n"))
         for expr, regex in (
-            (t.c.n.contains("ab"), ".*ab.*"),
-            (t.c.n.startswith("ab"), "^ab.*"),
-            (t.c.n.endswith("ab"), ".*ab$"),
-            (t.c.n.contains("5%_", autoescape=True), ".*5%_.*"),
-            (t.c.n.like("a/_%", escape="/"), "^a_.*"),
+            (t.c.n.contains("ab"), {"$regex": ".*ab.*"}),
+            (t.c.n.startswith("ab"), {"$regex": "^ab.*"}),
+            (t.c.n.endswith("ab"), {"$regex": ".*ab$"}),
+            (t.c.n.contains("5%_ %(k)s", autoescape=True), {"$regex": ".*5%_\\ %\\(k\\)s.*"}),
+            (t.c.n.like("a/_%", escape="/"), {"$regex": "^a_.*"}),
+            (t.c.n.ilike("A%"), {"$regex": "^A.*", "$options": "i"}),
         ):
-            sql = compiled(sa.select(t.c.n).where(expr))
-            assert plan(sql).filter_stage == {"n": {"$regex": regex}}, sql
+            compiled_stmt = sa.select(t.c.n).where(expr).compile(dialect=PyMongoSQLDialect())
+            params = [compiled_stmt.params[name] for name in compiled_stmt.positiontup]
+            bound, _ = SQLHelper.bind_filter(plan(str(compiled_stmt)).filter_stage, params)
+            assert bound == {"n": regex}, str(compiled_stmt)
 
 
 class TestParameters:
@@ -307,6 +321,8 @@ class TestLiveSQLAlchemy:
             ]
             assert list(c.execute(sa.select(t.c._id).where(t.c.n.endswith("b")).order_by(t.c._id)).scalars()) == [2, 3]
             assert list(c.execute(sa.select(t.c._id).where(t.c.n.contains("50%", autoescape=True))).scalars()) == [1]
+            assert list(c.execute(sa.select(t.c._id).where(t.c.n.ilike("AB%"))).scalars()) == [1]
+            assert list(c.execute(sa.select(t.c._id).where(t.c.n.like("%(k)s"))).scalars()) == []
             page = c.execute(sa.select(t.c._id).order_by(t.c._id).limit(2).offset(1)).scalars()
             assert list(page) == [2, 3]
             distinct = sa.func.count(sa.distinct(t.c.v)).label("d")

@@ -41,6 +41,29 @@ def is_param(value: Any) -> bool:
     return isinstance(value, dict) and list(value) == [PARAM_KEY]
 
 
+# A LIKE whose pattern contains a bound parameter ('%' || ? || '%', as SQLAlchemy renders
+# contains()); the regex is built when the parameters are bound.
+LIKE_KEY = "$pymongosqlLike"
+
+
+def is_like(value: Any) -> bool:
+    return isinstance(value, dict) and list(value) == [LIKE_KEY]
+
+
+def like_operator(pattern: str, escape: Optional[str], case_insensitive: bool) -> Dict[str, Any]:
+    """The $regex operator document for a LIKE pattern."""
+    regex, dotall = _like_regex(pattern, escape)
+    options = ("s" if dotall else "") + ("i" if case_insensitive else "")
+    return {"$regex": regex, "$options": options} if options else {"$regex": regex}
+
+
+class _Pattern:
+    """A LIKE pattern built from string literals and bound parameters."""
+
+    def __init__(self, parts: List[Any]):
+        self.parts = parts
+
+
 _LEAVES = (
     PartiQLParser.PredicateComparisonContext,
     PartiQLParser.PredicateIsContext,
@@ -194,14 +217,17 @@ def operand(ctx: Any, resolver: Any = None) -> Any:
             raise NotSupportedError(f"Unsupported signed expression: {node.getText()}")
         return value if node.sign.text == "+" else -value
     if isinstance(node, PartiQLParser.MathOp00Context) and node.op is not None and node.op.text == "||":
-        left, right = operand(node.lhs), operand(node.rhs)
-        if (
-            not (isinstance(left, str) and isinstance(right, str))
-            or isinstance(left, _Field)
-            or isinstance(right, _Field)
-        ):
-            raise NotSupportedError(f"Only string literals can be concatenated: {node.getText()}")
-        return left + right
+        parts = []
+        for side in (operand(node.lhs), operand(node.rhs)):
+            if isinstance(side, _Pattern):
+                parts.extend(side.parts)
+            elif (isinstance(side, str) and not isinstance(side, _Field)) or is_param(side):
+                parts.append(side)
+            else:
+                raise NotSupportedError(f"Only strings and parameters can be concatenated: {node.getText()}")
+        if all(isinstance(p, str) for p in parts):
+            return "".join(parts)
+        return _Pattern(parts)
     if isinstance(node, PartiQLParser.FunctionCallContext):
         from .value_function_registry import get_default_registry
 
@@ -266,15 +292,18 @@ def leaf_filters(field: str, operator: str, value: Any, escape: Optional[str] = 
         # x NOT IN (..., NULL) is never TRUE; x IN (..., NULL) is never FALSE
         false = NOTHING if None in values else {field: {"$nin": present + [None]}}
         return (true, false) if op == "IN" else (false, true)
-    if op in ("LIKE", "NOT LIKE"):
-        if is_param(value) or not isinstance(value, str):
-            # The pattern becomes a regex while parsing, before parameters are bound
-            raise NotSupportedError("LIKE needs a literal pattern, not a bound parameter")
-        pattern, dotall = _like_regex(value, escape)
-        regex = {"$regex": pattern, "$options": "s"} if dotall else {"$regex": pattern}
+    if op in ("LIKE", "NOT LIKE", "ILIKE", "NOT ILIKE"):
+        case_insensitive = "ILIKE" in op
+        if isinstance(value, str):
+            regex: Dict[str, Any] = like_operator(value, escape, case_insensitive)
+        elif is_param(value) or isinstance(value, _Pattern):
+            parts = value.parts if isinstance(value, _Pattern) else [value]
+            regex = {LIKE_KEY: {"parts": parts, "escape": escape, "i": case_insensitive}}
+        else:
+            raise NotSupportedError("LIKE needs a string pattern")
         true = {field: regex}
         false = {"$and": [{field: {"$not": regex}}, {field: {"$ne": None}}]}
-        return (true, false) if op == "LIKE" else (false, true)
+        return (true, false) if op in ("LIKE", "ILIKE") else (false, true)
     if op in ("BETWEEN", "NOT BETWEEN"):
         low, high = value
         true = {"$and": [{field: {"$gte": low}}, {field: {"$lte": high}}]}
@@ -384,12 +413,26 @@ class WhereTreeBuilder:
             return leaf_filters(field, "NOT BETWEEN" if negated else "BETWEEN", bounds)
         raise NotSupportedError(f"Unsupported predicate: {text}")
 
+    @staticmethod
+    def _case_folded(ctx: Any) -> Any:
+        """The argument of lower(x)/upper(x), as SQLAlchemy renders ILIKE; else None."""
+        node = _unwrap(ctx)
+        if isinstance(node, PartiQLParser.FunctionCallContext) and len(node.expr()) == 1:
+            if node.functionName().getText().lower() in ("lower", "upper"):
+                return node.expr()[0]
+        return None
+
     def _like(self, ctx: Any) -> Pair:
-        field = operand(ctx.lhs, self._resolver)
+        lhs, rhs, case_insensitive = ctx.lhs, ctx.rhs, False
+        folded_lhs, folded_rhs = self._case_folded(ctx.lhs), self._case_folded(ctx.rhs)
+        if folded_lhs is not None:
+            # lower(field) LIKE lower(pattern) or lower(field) LIKE 'pattern': case-insensitive
+            lhs, rhs, case_insensitive = folded_lhs, (folded_rhs if folded_rhs is not None else ctx.rhs), True
+        field = operand(lhs, self._resolver)
         if not isinstance(field, _Field):
             raise NotSupportedError(f"The left side of LIKE must be a field: {ctx.getText()}")
-        pattern = _value(ctx.rhs, self._resolver)
-        op = "NOT LIKE" if ctx.NOT() is not None else "LIKE"
+        pattern = _value(rhs, self._resolver)
+        op = ("NOT " if ctx.NOT() is not None else "") + ("ILIKE" if case_insensitive else "LIKE")
         if ctx.escape is None:
             return leaf_filters(field, op, pattern)
         # The grammar lets ESCAPE take a whole expression, so "a LIKE p ESCAPE '/' AND b = 1"

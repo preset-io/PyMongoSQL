@@ -120,15 +120,6 @@ class PyMongoSQLCompiler(compiler.SQLCompiler):
             text += "\n OFFSET " + self.process(select._offset_clause, literal_binds=True, **kw)
         return text
 
-    def visit_like_op_binary(self, binary, operator, **kw):
-        """Render LIKE patterns inline: PyMongoSQL turns them into a regex while parsing."""
-        kw["literal_binds"] = True
-        return super().visit_like_op_binary(binary, operator, **kw)
-
-    def visit_not_like_op_binary(self, binary, operator, **kw):
-        kw["literal_binds"] = True
-        return super().visit_not_like_op_binary(binary, operator, **kw)
-
 
 class PyMongoSQLDDLCompiler(compiler.DDLCompiler):
     """MongoDB-specific DDL compiler.
