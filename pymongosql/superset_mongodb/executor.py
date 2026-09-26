@@ -104,7 +104,11 @@ class SupersetExecution(StandardQueryExecution):
                 querydb_query = context.query
                 table_name = "virtual_table"
 
-            query_db.insert_records(table_name, mongo_dicts)
+            if mongo_dicts:
+                query_db.insert_records(table_name, mongo_dicts)
+            elif column_names:
+                # No rows: the outer query still reads the table (COUNT(*) is 0, not an error)
+                query_db.create_table(table_name, {name: "" for name in column_names})
 
             # Execute outer query against intermediate DB
             _logger.debug(f"Stage 2: Executing QueryDBSQLite query: {querydb_query}")

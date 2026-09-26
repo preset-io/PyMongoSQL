@@ -743,6 +743,20 @@ PyMongoSQL can be used as a database driver in Apache Superset for querying and 
 
 This allows seamless integration between MongoDB data and Superset's BI capabilities without requiring data migration to traditional SQL databases.
 
+**Time grains and decimals:**
+
+- `DATE_TRUNC('<unit>', field)` is translated to MongoDB's `$dateTrunc` (MongoDB 5.0+), in
+  projections and `GROUP BY`. Units: `second`, `minute`, `hour`, `day`, `week` (starting
+  Sunday), `week_monday`, `month`, `quarter`, `year`, `week_ending_saturday` and
+  `week_ending_sunday`. Truncation is in UTC. The same function is available in the
+  superset-mode SQLite stage, so virtual datasets group by time the same way.
+- In superset mode, a subquery's result is loaded into an in-memory SQLite database. Columns
+  holding `Decimal128` values are evaluated exactly there (install `pymongosql[superset]`,
+  which adds `sqlglot`): the column itself, `SUM`/`AVG`/`MIN`/`MAX` over it, `GROUP BY`,
+  `ORDER BY` and comparisons with numeric literals, with Decimal128's 34 significant
+  digits. Any other use of such a column (arithmetic, other functions, `DISTINCT`
+  aggregates) raises `NotSupportedError` rather than computing with doubles.
+
 **Important Note on Collection Names:**
 
 When using collection names containing special characters (`.`, `-`, `:`), you must wrap them in double quotes to prevent Superset's SQL parser from incorrectly interpreting them.

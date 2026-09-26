@@ -5,7 +5,6 @@ import json
 
 import pytest
 
-from pymongosql.error import Error
 from pymongosql.sql.parser import SQLParser
 from tests.conftest import HAS_SQLALCHEMY, make_superset_conn
 
@@ -33,8 +32,10 @@ class TestPlans:
         assert stages[1]["$project"] == {"_id": 0, "flag": "$_id.g0", "n": 1}
 
     def test_aggregate_query_keeps_order_by_skip_and_limit(self):
-        stages = pipeline("SELECT dept, SUM(amount) AS total FROM t GROUP BY dept ORDER BY total DESC LIMIT 1 OFFSET 1")
-        assert stages[-3:] == [{"$sort": {"total": -1}}, {"$skip": 1}, {"$limit": 1}]
+        p = plan("SELECT dept, SUM(amount) AS total FROM t GROUP BY dept ORDER BY total DESC LIMIT 1 OFFSET 1")
+        assert json.loads(p.aggregate_pipeline)[-1] == {"$sort": {"total": -1}}
+        # OFFSET/LIMIT are applied after binding (they may be parameters)
+        assert (p.skip_stage, p.limit_stage) == (1, 1)
 
     def test_order_by_aggregate_expression_uses_its_output(self):
         stages = pipeline("SELECT dept, SUM(amount) AS total FROM t GROUP BY dept ORDER BY SUM(amount)")
@@ -54,13 +55,13 @@ class TestPlans:
         with pytest.raises(Exception, match="must appear in GROUP BY"):
             plan("SELECT flag, COUNT(*) FROM t")
 
-    def test_having_is_rejected_not_ignored(self):
-        with pytest.raises(Exception, match="HAVING"):
-            plan("SELECT flag, COUNT(*) AS n FROM t GROUP BY flag HAVING COUNT(*) > 1")
+    def test_having_filters_groups(self):
+        stages = pipeline("SELECT flag, COUNT(*) AS n FROM t GROUP BY flag HAVING COUNT(*) > 1")
+        assert stages[2] == {"$match": {"n": {"$gt": 1}}}
 
     def test_in_keeps_literal_types_and_quoted_commas(self):
         p = plan("SELECT _id FROM t WHERE _id IN (1, 2.5, 'a,b', 'it''s', TRUE, ?)")
-        assert p.filter_stage == {"_id": {"$in": [1, 2.5, "a,b", "it's", True, "?"]}}
+        assert p.filter_stage == {"_id": {"$in": [1, 2.5, "a,b", "it's", True, {"$pymongosqlParam": True}]}}
 
     def test_not_in(self):
         assert plan("SELECT _id FROM t WHERE _id NOT IN (1, 2)").filter_stage == {"_id": {"$nin": [1, 2, None]}}
@@ -160,9 +161,9 @@ class TestLive:
         finally:
             conn.close()
 
-    def test_unsupported_having_raises(self, grouping_collection):
-        with pytest.raises(Error):
-            rows(grouping_collection, f"SELECT flag, COUNT(*) AS n FROM {COLLECTION} GROUP BY flag HAVING n > 1")
+    def test_having_returns_only_matching_groups(self, grouping_collection):
+        got = rows(grouping_collection, f"SELECT flag, COUNT(*) AS n FROM {COLLECTION} GROUP BY flag HAVING n > 1")
+        assert got == [(True, 3)]
 
 
 @pytest.mark.skipif(not HAS_SQLALCHEMY, reason="SQLAlchemy not available")

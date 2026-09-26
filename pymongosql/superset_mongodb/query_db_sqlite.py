@@ -1,9 +1,14 @@
 # -*- coding: utf-8 -*-
+import datetime
 import logging
 import sqlite3
+from decimal import Decimal
 from typing import Any, Dict, List, Optional
 
+from ..error import NotSupportedError
+from . import exact_decimal
 from .query_db import QueryDatabase
+from .time_grain import date_trunc_text, datetime_positions, datetime_text, parse_text, str_to_datetime_text
 
 _logger = logging.getLogger(__name__)
 
@@ -12,6 +17,11 @@ _logger = logging.getLogger(__name__)
 # the column itself; expressions over it (SUM, CASE, ...) keep their numeric result.
 BOOLEAN_DECLTYPE = "PYMONGOSQL_BOOL"
 sqlite3.register_converter(BOOLEAN_DECLTYPE, lambda raw: int(raw) != 0)
+# Datetimes are stored as fixed-width UTC text (so text order is time order) and read
+# back as datetime when a query selects the column itself.
+DATETIME_DECLTYPE = "PYMONGOSQL_DATETIME"
+sqlite3.register_converter(DATETIME_DECLTYPE, lambda raw: datetime.datetime.fromisoformat(raw.decode()))
+_NUMERIC = ("INTEGER", "REAL")
 
 
 class SQLiteTypeMapper:
@@ -23,6 +33,8 @@ class SQLiteTypeMapper:
         int: "INTEGER",
         float: "REAL",
         bool: BOOLEAN_DECLTYPE,  # stored as 0/1, read back as bool
+        Decimal: "REAL",  # approximate copy; the exact text is kept in a side table
+        datetime.datetime: DATETIME_DECLTYPE,
         bytes: "BLOB",
         type(None): "NULL",
         dict: "TEXT",  # Store as JSON string
@@ -62,6 +74,8 @@ class SQLiteTypeMapper:
                 if current == "NULL":
                     # First non-null value determines the type; NULL fits every type
                     schema[col_name] = new_type
+                elif new_type in _NUMERIC and current in _NUMERIC:
+                    schema[col_name] = "REAL" if "REAL" in (new_type, current) else "INTEGER"
                 elif new_type not in ("NULL", current):
                     # Upgrade to TEXT if types differ (safest option)
                     schema[col_name] = "TEXT"
@@ -74,6 +88,8 @@ class SQLiteTypeMapper:
         if value is None:
             return None
 
+        if target_type == DATETIME_DECLTYPE:
+            return datetime_text(value)
         if target_type in ("INTEGER", BOOLEAN_DECLTYPE):
             return int(value) if value is not None else None
         elif target_type == "REAL":
@@ -103,6 +119,7 @@ class QueryDBSQLite(QueryDatabase):
         """Initialize SQLite3 bridge with in-memory database"""
         self._connection: Optional[sqlite3.Connection] = None
         self._tables: Dict[str, Dict[str, str]] = {}  # table_name -> schema
+        self._exact_columns: Dict[str, List[str]] = {}  # table_name -> columns with decimals
         self._is_closed = False
 
     def _ensure_connection(self) -> sqlite3.Connection:
@@ -113,6 +130,10 @@ class QueryDBSQLite(QueryDatabase):
         if self._connection is None:
             # Create in-memory database
             self._connection = sqlite3.connect(":memory:", detect_types=sqlite3.PARSE_DECLTYPES)
+            # Time-grain functions the engine spec's expressions use
+            self._connection.create_function("date_trunc", 2, date_trunc_text, deterministic=True)
+            self._connection.create_function("str_to_datetime", -1, str_to_datetime_text, deterministic=True)
+            exact_decimal.register(self._connection)
             # Enable row factory to get dict-like rows
             self._connection.row_factory = sqlite3.Row
             _logger.debug("Created in-memory SQLite3 database")
@@ -170,7 +191,8 @@ class QueryDBSQLite(QueryDatabase):
         # Build INSERT statement
         columns = list(records[0].keys())
         placeholders = ", ".join(["?" for _ in columns])
-        insert_sql = f"INSERT INTO {table_name} ({', '.join(columns)}) VALUES ({placeholders})"
+        quoted = ", ".join('"%s"' % col.replace('"', '""') for col in columns)
+        insert_sql = f'INSERT INTO "{table_name}" ({quoted}) VALUES ({placeholders})'
 
         # Convert values to appropriate types
         schema = self._tables[table_name]
@@ -183,13 +205,42 @@ class QueryDBSQLite(QueryDatabase):
             converted_records.append(converted_row)
 
         try:
+            first_rowid = conn.execute(f'SELECT COALESCE(MAX(rowid), 0) + 1 FROM "{table_name}"').fetchone()[0]
             conn.executemany(insert_sql, converted_records)
+            self._write_exact_copies(table_name, columns, records, first_rowid)
             conn.commit()
             _logger.debug(f"Inserted {len(records)} records into {table_name}")
             return len(records)
         except sqlite3.Error as e:
             _logger.error(f"Error inserting records into {table_name}: {e}")
             raise
+
+    def _write_exact_copies(
+        self, table_name: str, columns: List[str], records: List[Dict[str, Any]], first_rowid: int
+    ) -> None:
+        """Keep the exact text of every column holding decimals (see exact_decimal)."""
+        exact = []
+        for col in columns:
+            values = [r.get(col) for r in records if r.get(col) is not None]
+            if any(isinstance(v, Decimal) for v in values) and all(
+                isinstance(v, (int, float, Decimal)) and not isinstance(v, bool) for v in values
+            ):
+                exact.append(col)
+        if not exact:
+            return
+        if table_name in self._exact_columns:
+            raise NotSupportedError("Decimal columns can be loaded into a query table only once")
+        self._exact_columns[table_name] = exact
+        conn = self._ensure_connection()
+        side = f'"{table_name}_exact"'
+        conn.execute(f"CREATE TABLE {side} (rid INTEGER PRIMARY KEY, %s)" % ", ".join('"%s" TEXT' % c for c in exact))
+        conn.executemany(
+            f"INSERT INTO {side} VALUES ({', '.join('?' * (len(exact) + 1))})",
+            [
+                (rid,) + tuple(None if r.get(c) is None else str(r.get(c)) for c in exact)
+                for rid, r in enumerate(records, start=first_rowid)
+            ],
+        )
 
     def execute_query(self, query: str) -> List[Dict[str, Any]]:
         """
@@ -203,13 +254,29 @@ class QueryDBSQLite(QueryDatabase):
         """
         conn = self._ensure_connection()
 
+        positions: List[int] = []
+        dates = datetime_positions(query)
+        for table, exact in self._exact_columns.items():
+            if table in query:
+                query, positions = exact_decimal.rewrite(query, table, exact, list(self._tables[table]))
         try:
             cursor = conn.execute(query)
             # Fetch all rows and convert from sqlite3.Row to dict
             rows = cursor.fetchall()
 
             column_names = [desc[0] for desc in cursor.description] if cursor.description else []
-            return [dict(zip(column_names, row)) for row in rows]
+
+            def convert(index: int, value: Any) -> Any:
+                if value is None:
+                    return None
+                if index in positions:
+                    return Decimal(value)
+                return parse_text(value) if index in dates else value
+
+            return [
+                {name: convert(index, value) for index, (name, value) in enumerate(zip(column_names, row))}
+                for row in rows
+            ]
         except sqlite3.Error as e:
             _logger.error(f"Error executing query: {e}")
             raise

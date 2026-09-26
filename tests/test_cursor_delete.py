@@ -89,7 +89,7 @@ class TestCursorDelete:
     def test_delete_with_qmark_parameters(self, conn):
         """Test DELETE with qmark (?) placeholder parameters."""
         cursor = conn.cursor()
-        result = cursor.execute(f"DELETE FROM {self.TEST_COLLECTION} WHERE artist = '?'", ["Charlie"])
+        result = cursor.execute(f"DELETE FROM {self.TEST_COLLECTION} WHERE artist = ?", ["Charlie"])
 
         assert result == cursor
 
@@ -104,7 +104,7 @@ class TestCursorDelete:
     def test_delete_with_multiple_parameters(self, conn):
         """Test DELETE with multiple qmark parameters."""
         cursor = conn.cursor()
-        result = cursor.execute(f"DELETE FROM {self.TEST_COLLECTION} WHERE genre = '?' AND year = '?'", ["Pop", 2019])
+        result = cursor.execute(f"DELETE FROM {self.TEST_COLLECTION} WHERE genre = ? AND year = ?", ["Pop", 2019])
 
         assert result == cursor
 
@@ -184,7 +184,7 @@ class TestCursorDelete:
     def test_delete_executemany_with_parameters(self, conn):
         """Test executemany for bulk delete operations with parameters."""
         cursor = conn.cursor()
-        sql = f"DELETE FROM {self.TEST_COLLECTION} WHERE artist = '?'"
+        sql = f"DELETE FROM {self.TEST_COLLECTION} WHERE artist = ?"
 
         # Delete multiple artists using executemany
         params = [["Alice"], ["Charlie"], ["Eve"]]
