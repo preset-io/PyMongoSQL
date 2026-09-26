@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import logging
+import re
 import uuid
 from typing import Any, Dict, List, Optional, Tuple, Type
 from urllib.parse import quote_plus
@@ -114,11 +115,35 @@ class PyMongoSQLCompiler(compiler.SQLCompiler):
     def limit_clause(self, select, **kw):
         """Render LIMIT/OFFSET as integer literals: PyMongoSQL reads them while parsing."""
         text = ""
+        kw = {**kw, "literal_binds": True}
         if select._limit_clause is not None:
-            text += "\n LIMIT " + self.process(select._limit_clause, literal_binds=True, **kw)
+            text += "\n LIMIT " + self.process(select._limit_clause, **kw)
         if select._offset_clause is not None:
-            text += "\n OFFSET " + self.process(select._offset_clause, literal_binds=True, **kw)
+            text += "\n OFFSET " + self.process(select._offset_clause, **kw)
         return text
+
+    # A quoted SQL string literal or quoted identifier ('' and "" escape the quote)
+    _QUOTED = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+    def _process_positional(self):
+        """Convert bind markers to qmark without touching quoted literals.
+
+        SQLAlchemy 2.0 renders every bind as ``%(name)s`` and then rewrites the
+        whole statement with a regular expression. That also rewrites the text of a
+        string literal rendered inline (``literal_binds``), so ``x = '%(k)s'`` became
+        ``x = '?'``. Quoted segments are masked while the markers are converted.
+        """
+        masked: List[str] = []
+
+        def mask(match: "re.Match[str]") -> str:
+            masked.append(match.group(0))
+            return "\x00%d\x00" % (len(masked) - 1)
+
+        self.string = self._QUOTED.sub(mask, self.string)
+        try:
+            super()._process_positional()
+        finally:
+            self.string = re.sub("\x00(\\d+)\x00", lambda m: masked[int(m.group(1))], self.string)
 
 
 class PyMongoSQLDDLCompiler(compiler.DDLCompiler):
