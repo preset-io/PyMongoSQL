@@ -1,11 +1,13 @@
 # -*- coding: utf-8 -*-
 import logging
+import re
+import uuid
 from typing import Any, Dict, List, Optional, Tuple, Type
 from urllib.parse import quote_plus
 
 from sqlalchemy import pool, types
 from sqlalchemy.engine import default, url
-from sqlalchemy.sql import compiler
+from sqlalchemy.sql import compiler, sqltypes
 from sqlalchemy.sql.sqltypes import NULLTYPE
 
 import pymongosql
@@ -32,6 +34,19 @@ else:
     from sqlalchemy.engine.interfaces import Dialect
 
 
+def _partiql_keywords() -> set:
+    """Lower-case PartiQL keywords, e.g. ``count`` or ``value``.
+
+    The grammar rejects a keyword used as a bare identifier (``COUNT(*) AS count``
+    is a syntax error), so SQLAlchemy must quote these names.
+    """
+    import re
+
+    from pymongosql.sql.partiql.PartiQLLexer import PartiQLLexer
+
+    return {name.strip("'").lower() for name in PartiQLLexer.literalNames if re.fullmatch(r"'[A-Za-z_]+'", name or "")}
+
+
 class PyMongoSQLIdentifierPreparer(compiler.IdentifierPreparer):
     """MongoDB-specific identifier preparer.
 
@@ -39,35 +54,38 @@ class PyMongoSQLIdentifierPreparer(compiler.IdentifierPreparer):
     from SQL databases.
     """
 
-    reserved_words = set(
-        [
-            # MongoDB reserved words and operators
-            "$eq",
-            "$ne",
-            "$gt",
-            "$gte",
-            "$lt",
-            "$lte",
-            "$in",
-            "$nin",
-            "$and",
-            "$or",
-            "$not",
-            "$nor",
-            "$exists",
-            "$type",
-            "$mod",
-            "$regex",
-            "$text",
-            "$where",
-            "$all",
-            "$elemMatch",
-            "$size",
-            "$bitsAllClear",
-            "$bitsAllSet",
-            "$bitsAnyClear",
-            "$bitsAnySet",
-        ]
+    reserved_words = (
+        set(
+            [
+                # MongoDB reserved words and operators
+                "$eq",
+                "$ne",
+                "$gt",
+                "$gte",
+                "$lt",
+                "$lte",
+                "$in",
+                "$nin",
+                "$and",
+                "$or",
+                "$not",
+                "$nor",
+                "$exists",
+                "$type",
+                "$mod",
+                "$regex",
+                "$text",
+                "$where",
+                "$all",
+                "$elemMatch",
+                "$size",
+                "$bitsAllClear",
+                "$bitsAllSet",
+                "$bitsAnyClear",
+                "$bitsAnySet",
+            ]
+        )
+        | _partiql_keywords()
     )
 
     def __init__(self, dialect: Dialect, **kwargs: Any) -> None:
@@ -84,14 +102,48 @@ class PyMongoSQLCompiler(compiler.SQLCompiler):
     Handles SQL compilation specific to MongoDB's query patterns.
     """
 
-    def visit_column(self, column, **kwargs):
-        """Handle column references for MongoDB field names."""
-        name = column.name
-        # Handle MongoDB-specific field name patterns
-        if name.startswith("_"):
-            # MongoDB system fields like _id
-            return self.preparer.quote(name)
-        return super().visit_column(column, **kwargs)
+    def visit_column(self, column, include_table=True, **kwargs):
+        """Render column references without a table qualifier.
+
+        A statement reads a single collection, and PyMongoSQL resolves a dotted
+        reference such as ``users.name`` as the embedded-document path ``name``
+        inside a field ``users``. SQLAlchemy qualifies every table-bound column,
+        so a qualified reference would silently read NULL.
+        """
+        return super().visit_column(column, include_table=False, **kwargs)
+
+    def limit_clause(self, select, **kw):
+        """Render LIMIT/OFFSET as integer literals: PyMongoSQL reads them while parsing."""
+        text = ""
+        kw = {**kw, "literal_binds": True}
+        if select._limit_clause is not None:
+            text += "\n LIMIT " + self.process(select._limit_clause, **kw)
+        if select._offset_clause is not None:
+            text += "\n OFFSET " + self.process(select._offset_clause, **kw)
+        return text
+
+    # A quoted SQL string literal or quoted identifier ('' and "" escape the quote)
+    _QUOTED = re.compile(r"'(?:[^']|'')*'|\"(?:[^\"]|\"\")*\"")
+
+    def _process_positional(self):
+        """Convert bind markers to qmark without touching quoted literals.
+
+        SQLAlchemy 2.0 renders every bind as ``%(name)s`` and then rewrites the
+        whole statement with a regular expression. That also rewrites the text of a
+        string literal rendered inline (``literal_binds``), so ``x = '%(k)s'`` became
+        ``x = '?'``. Quoted segments are masked while the markers are converted.
+        """
+        masked: List[str] = []
+
+        def mask(match: "re.Match[str]") -> str:
+            masked.append(match.group(0))
+            return "\x00%d\x00" % (len(masked) - 1)
+
+        self.string = self._QUOTED.sub(mask, self.string)
+        try:
+            super()._process_positional()
+        finally:
+            self.string = re.sub("\x00(\\d+)\x00", lambda m: masked[int(m.group(1))], self.string)
 
 
 class PyMongoSQLDDLCompiler(compiler.DDLCompiler):
@@ -151,6 +203,80 @@ class PyMongoSQLTypeCompiler(compiler.GenericTypeCompiler):
         return "BOOL"
 
 
+def _decode_decimal128(processor):
+    """Wrap a Numeric result processor so it also accepts BSON Decimal128."""
+    from bson import Decimal128
+
+    def process(value):
+        if isinstance(value, Decimal128):
+            value = value.to_decimal()
+        return processor(value) if processor else value
+
+    return process
+
+
+class _MongoNumeric(sqltypes.Numeric):
+    """Numeric that returns ``decimal.Decimal`` (or float) for Decimal128 values."""
+
+    def result_processor(self, dialect, coltype):
+        return _decode_decimal128(super().result_processor(dialect, coltype))
+
+
+class _MongoInteger(sqltypes.Integer):
+    """Integer that returns ``int`` for BSON int64 values (``bson.Int64``)."""
+
+    def result_processor(self, dialect, coltype):
+        from bson import Int64
+
+        def process(value):
+            return int(value) if isinstance(value, Int64) else value
+
+        return process
+
+
+class _MongoFloat(sqltypes.Float):
+    """Float that returns ``float`` (or Decimal) for Decimal128 values."""
+
+    def result_processor(self, dialect, coltype):
+        return _decode_decimal128(super().result_processor(dialect, coltype))
+
+
+class _MongoUuid(getattr(sqltypes, "Uuid", sqltypes.TypeEngine)):  # Uuid is new in SQLAlchemy 2.0
+    """Uuid stored as BSON binary subtype 4 (the standard UUID representation).
+
+    PyMongo returns ``uuid.UUID`` under ``uuidRepresentation=standard`` and a
+    subtype-4 ``Binary`` otherwise; the generic non-native Uuid processors expect a
+    hex string and fail on both. Legacy subtype 3 is left as ``Binary``: its byte
+    order depends on the driver that wrote it.
+    """
+
+    def bind_processor(self, dialect):
+        from bson.binary import Binary
+
+        def process(value):
+            if value is None:
+                return None
+            if not isinstance(value, uuid.UUID):
+                value = uuid.UUID(str(value))
+            return Binary.from_uuid(value)
+
+        return process
+
+    def result_processor(self, dialect, coltype):
+        from bson.binary import UUID_SUBTYPE, Binary
+
+        def process(value):
+            if isinstance(value, Binary) and value.subtype == UUID_SUBTYPE:
+                value = value.as_uuid()
+            elif isinstance(value, str):
+                value = uuid.UUID(value)
+            if isinstance(value, uuid.UUID) and not self.as_uuid:
+                return str(value)
+            return value
+
+        return process
+
+
 class PyMongoSQLDialect(default.DefaultDialect):
     """SQLAlchemy dialect for PyMongoSQL.
 
@@ -174,6 +300,11 @@ class PyMongoSQLDialect(default.DefaultDialect):
     supports_empty_inserts = True
     supports_multivalues_insert = True
     supports_native_decimal = True  # BSON Decimal128
+    # PyMongo returns Decimal128, not decimal.Decimal; convert on the way out.
+    supports_native_uuid = True  # BSON binary subtype 4
+    colspecs = {sqltypes.Numeric: _MongoNumeric, sqltypes.Float: _MongoFloat, sqltypes.Integer: _MongoInteger}
+    if hasattr(sqltypes, "Uuid"):
+        colspecs[sqltypes.Uuid] = _MongoUuid
     supports_native_boolean = True  # BSON Boolean
     supports_sequences = False  # No sequences in MongoDB
     supports_native_enum = False  # No native enums
@@ -384,11 +515,12 @@ class PyMongoSQLDialect(default.DefaultDialect):
                 # Sample a few documents to infer schema
                 sample_docs = list(collection.find().limit(10))
                 if sample_docs:
-                    # Collect all unique field names and types
+                    # Collect all unique field names and types. A null only
+                    # types a field that no sampled document gives a value.
                     field_types = {}
                     for doc in sample_docs:
                         for field_name, value in doc.items():
-                            if field_name not in field_types:
+                            if field_types.get(field_name, "null") == "null":
                                 field_types[field_name] = self._infer_bson_type(value)
 
                     # Convert to SQLAlchemy column format
@@ -430,7 +562,7 @@ class PyMongoSQLDialect(default.DefaultDialect):
         """Infer BSON type from a Python value."""
         from datetime import datetime
 
-        from bson import ObjectId
+        from bson import Binary, Decimal128, Int64, ObjectId
 
         if isinstance(value, ObjectId):
             return "objectId"
@@ -438,8 +570,14 @@ class PyMongoSQLDialect(default.DefaultDialect):
             return "string"
         elif isinstance(value, bool):
             return "bool"
+        elif isinstance(value, Int64):
+            return "long"
         elif isinstance(value, int):
             return "int"
+        elif isinstance(value, Decimal128):
+            return "decimal"
+        elif isinstance(value, (Binary, bytes)):
+            return "binData"
         elif isinstance(value, float):
             return "double"
         elif isinstance(value, datetime):
@@ -469,7 +607,7 @@ class PyMongoSQLDialect(default.DefaultDialect):
             "object": types.JSON,
             "binData": types.LargeBinary,
         }
-        return type_map.get(mongo_type.lower(), types.String)
+        return type_map.get(mongo_type, types.String)
 
     def get_pk_constraint(self, connection, table_name: str, schema: Optional[str] = None, **kwargs) -> Dict[str, Any]:
         """Get primary key constraint info.

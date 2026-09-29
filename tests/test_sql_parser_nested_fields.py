@@ -146,7 +146,7 @@ class TestSQLParserNestedFields:
             ("profile.age > 18", {"profile.age": {"$gt": 18}}),
             ("settings.total < 100", {"settings.total": {"$lt": 100}}),  # Changed from 'count' (reserved)
             ("status.active = true", {"status.active": True}),
-            ("config.name != 'default'", {"config.name": {"$ne": "default"}}),
+            ("config.name != 'default'", {"config.name": {"$nin": ["default", None]}}),
         ]
 
         for where_clause, expected_filter in test_cases:

@@ -63,7 +63,10 @@ class SupersetExecution(StandardQueryExecution):
         _logger.debug(f"Stage 1: Executing MongoDB subquery: {mongo_query}")
 
         mongo_execution_plan = self._parse_sql(mongo_query)
-        mongo_result = self._execute_find_plan(mongo_execution_plan, connection)
+        if mongo_execution_plan.is_aggregate_query:
+            mongo_result = self._execute_aggregate_plan(mongo_execution_plan, connection)
+        else:
+            mongo_result = self._execute_find_plan(mongo_execution_plan, connection)
 
         # Extract result set from MongoDB
         mongo_result_set = ResultSet(
@@ -101,7 +104,11 @@ class SupersetExecution(StandardQueryExecution):
                 querydb_query = context.query
                 table_name = "virtual_table"
 
-            query_db.insert_records(table_name, mongo_dicts)
+            if mongo_dicts:
+                query_db.insert_records(table_name, mongo_dicts)
+            elif column_names:
+                # No rows: the outer query still reads the table (COUNT(*) is 0, not an error)
+                query_db.create_table(table_name, {name: "" for name in column_names})
 
             # Execute outer query against intermediate DB
             _logger.debug(f"Stage 2: Executing QueryDBSQLite query: {querydb_query}")

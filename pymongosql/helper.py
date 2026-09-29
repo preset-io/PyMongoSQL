@@ -6,8 +6,11 @@ Handles connection string parsing and mode detection.
 """
 
 import logging
+from decimal import Decimal
 from typing import Any, Optional, Sequence, Tuple
 from urllib.parse import parse_qs, urlparse
+
+from bson import Decimal128
 
 from .error import ProgrammingError
 
@@ -103,6 +106,66 @@ class SQLHelper:
     """SQL-related helper utilities."""
 
     @staticmethod
+    def to_bson_value(value: Any) -> Any:
+        """Convert a bound parameter to a type BSON can encode.
+
+        ``decimal.Decimal`` has no BSON encoding; ``Decimal128`` stores it exactly.
+        """
+        if isinstance(value, Decimal):
+            return Decimal128(value)
+        if isinstance(value, dict):
+            return {k: SQLHelper.to_bson_value(v) for k, v in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [SQLHelper.to_bson_value(v) for v in value]
+        return value
+
+    @staticmethod
+    def bind_filter(value: Any, parameters: Any, exact: bool = True) -> Tuple[Any, int]:
+        """Bind positional parameters to the parameter markers of a translated filter.
+
+        Translated WHERE clauses mark each ``?`` with a dict marker, so a string literal
+        '?' is never taken for a parameter. With ``exact``, every parameter must be used:
+        a parameter the translation dropped (e.g. a LIMIT it could not read) must not
+        silently widen the query. Returns the bound value and the number used.
+        """
+        from .sql.where_tree import LIKE_KEY, is_like, is_param, like_operator
+
+        params = [] if parameters is None else parameters
+        if isinstance(params, dict) or not isinstance(params, Sequence) or isinstance(params, (str, bytes)):
+            raise ProgrammingError("Positional parameters must be provided as a sequence")
+        idx = [0]
+
+        def take() -> Any:
+            if idx[0] >= len(params):
+                raise ProgrammingError("Not enough parameters provided")
+            out = params[idx[0]]
+            idx[0] += 1
+            return out
+
+        def replace(val: Any) -> Any:
+            if is_param(val):
+                return SQLHelper.to_bson_value(take())
+            if is_like(val):
+                like = val[LIKE_KEY]
+                parts = []
+                for part in like["parts"]:
+                    part = take() if is_param(part) else part
+                    if not isinstance(part, str):
+                        raise ProgrammingError(f"A LIKE pattern parameter must be a string, got {part!r}")
+                    parts.append(part)
+                return like_operator("".join(parts), like["escape"], like["i"])
+            if isinstance(val, dict):
+                return {k: replace(v) for k, v in val.items()}
+            if isinstance(val, list):
+                return [replace(v) for v in val]
+            return val
+
+        bound = replace(value)
+        if exact and idx[0] != len(params):
+            raise ProgrammingError(f"{len(params)} parameters were given but the statement uses {idx[0]}")
+        return bound, idx[0]
+
+    @staticmethod
     def replace_placeholders_generic(value: Any, parameters: Any, style: Optional[str]) -> Any:
         """Recursively replace placeholders in nested structures for qmark or named styles."""
         if style is None or parameters is None:
@@ -120,7 +183,7 @@ class SQLHelper:
                         raise ProgrammingError("Not enough parameters provided")
                     out = parameters[idx[0]]
                     idx[0] += 1
-                    return out
+                    return SQLHelper.to_bson_value(out)
                 if isinstance(val, dict):
                     return {k: replace(v) for k, v in val.items()}
                 if isinstance(val, list):
@@ -138,7 +201,7 @@ class SQLHelper:
                     key = val[1:]
                     if key not in parameters:
                         raise ProgrammingError(f"Missing named parameter: {key}")
-                    return parameters[key]
+                    return SQLHelper.to_bson_value(parameters[key])
                 if isinstance(val, dict):
                     return {k: replace(v) for k, v in val.items()}
                 if isinstance(val, list):

@@ -88,16 +88,24 @@ class SQLParser(metaclass=ABCMeta):
         # Remove extra whitespace and normalize
         sql = self._original_sql.strip()
 
-        # Remove comments (basic implementation)
-        lines = []
-        for line in sql.split("\n"):
-            # Remove single-line comments
-            if "--" in line:
-                line = line[: line.index("--")]
-            lines.append(line)
+        # Remove single-line comments; "--" inside a quoted literal or identifier is data
+        lines = [self._strip_line_comment(line) for line in sql.split("\n")]
 
         self._preprocessed_sql = " ".join(lines).strip()
         _logger.debug(f"Preprocessed SQL: {self._preprocessed_sql}")
+
+    @staticmethod
+    def _strip_line_comment(line: str) -> str:
+        quote = None
+        for i, char in enumerate(line):
+            if quote:
+                if char == quote:
+                    quote = None  # a doubled quote closes and reopens: same result
+            elif char in ("'", '"'):
+                quote = char
+            elif line.startswith("--", i):
+                return line[:i]
+        return line
 
     def _generate_ast(self) -> None:
         """Generate Abstract Syntax Tree from SQL"""

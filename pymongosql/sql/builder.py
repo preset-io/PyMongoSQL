@@ -2,7 +2,9 @@
 import json
 import logging
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
+
+from bson import json_util
 
 if TYPE_CHECKING:
     from .delete_builder import DeleteExecutionPlan
@@ -111,18 +113,74 @@ class ExecutionPlanBuilder:
             return ExecutionPlanBuilder._build_query_plan(parse_result)
 
     @staticmethod
+    def _strip_collection_qualifier(parse_result: "QueryParseResult") -> None:
+        """Resolve ``collection.field`` references to ``field``.
+
+        SQL qualifies a column with the table it belongs to, while MongoDB reads a
+        dotted name as an embedded-document path. Without this, a qualified
+        reference such as ``users.name`` reads the missing path ``users.name``
+        and silently returns NULL. As in SQL, the collection name takes
+        precedence over an embedded document of the same name.
+        """
+        collection = parse_result.collection
+        if not collection:
+            return
+        # With FROM users AS u, u.name is the column name; so is users.name
+        prefixes = [f"{q}." for q in (parse_result.collection_alias, collection) if q]
+
+        def strip(name: Any) -> Any:
+            for prefix in prefixes:
+                if isinstance(name, str) and name.startswith(prefix) and len(name) > len(prefix):
+                    return name[len(prefix) :]
+            return name
+
+        def strip_filter(value: Any) -> Any:
+            if isinstance(value, dict):
+                return {strip(k): strip_filter(v) for k, v in value.items()}
+            if isinstance(value, list):
+                return [strip_filter(v) for v in value]
+            return value
+
+        parse_result.projection = {strip(k): v for k, v in parse_result.projection.items()}
+        parse_result.column_aliases = {strip(k): v for k, v in parse_result.column_aliases.items()}
+        parse_result.sort_fields = [{strip(k): v for k, v in spec.items()} for spec in parse_result.sort_fields]
+        parse_result.filter_conditions = strip_filter(parse_result.filter_conditions)
+        for func_info in parse_result.aggregate_functions:
+            func_info["argument"] = strip(func_info["argument"])
+        parse_result.group_by = [strip(name) for name in parse_result.group_by]
+        for expression in parse_result.computed.values():
+            expression["field"] = strip(expression["field"])
+        for item in parse_result.select_items:
+            if "field" in item:
+                item["field"] = strip(item["field"])
+
+    @staticmethod
     def _build_query_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":
         """Build a query execution plan from SELECT parsing."""
+        from ..error import NotSupportedError
 
-        # Auto-generate aggregate pipeline for SQL aggregate functions (COUNT, SUM, etc.)
-        if getattr(parse_result, "aggregate_functions", None):
+        ExecutionPlanBuilder._strip_collection_qualifier(parse_result)
+        if parse_result.unsupported_clauses:
+            raise NotSupportedError(f"Unsupported SQL clause: {', '.join(parse_result.unsupported_clauses)}")
+
+        # Auto-generate aggregate pipeline for SQL aggregate functions (COUNT, SUM, etc.), GROUP BY and HAVING
+        if parse_result.aggregate_functions or parse_result.group_by or parse_result.having is not None:
             return ExecutionPlanBuilder._build_sql_aggregate_plan(parse_result)
+        if any("computed" in item for item in parse_result.select_items):
+            return ExecutionPlanBuilder._build_computed_plan(parse_result)
+
+        # ORDER BY may name a column by its SELECT alias; find() sorts on the field
+        field_for_alias = {alias: name for name, alias in parse_result.column_aliases.items()}
+        sort_fields = [
+            {field_for_alias.get(name, name): direction for name, direction in spec.items()}
+            for spec in parse_result.sort_fields
+        ]
 
         builder = BuilderFactory.create_query_builder().collection(parse_result.collection)
 
         builder.filter(parse_result.filter_conditions).project(parse_result.projection).column_aliases(
             parse_result.column_aliases
-        ).sort(parse_result.sort_fields).limit(parse_result.limit_value).skip(parse_result.offset_value)
+        ).sort(sort_fields).limit(parse_result.limit_value).skip(parse_result.offset_value)
 
         # Set aggregate flags BEFORE building (needed for validation)
         if hasattr(parse_result, "is_aggregate_query") and parse_result.is_aggregate_query:
@@ -135,8 +193,138 @@ class ExecutionPlanBuilder:
         return plan
 
     @staticmethod
+    def _build_computed_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":
+        """A SELECT with computed columns (DATE_TRUNC) and no grouping.
+
+        Pipeline: $match (WHERE), $addFields (computed columns), $sort, then $project of
+        the SELECT list in order; OFFSET/LIMIT are applied after binding.
+        """
+        from ..superset_mongodb.time_grain import mongo_expression
+
+        builder = BuilderFactory.create_query_builder().collection(parse_result.collection)
+        pipeline: List[Dict[str, Any]] = []
+        if parse_result.filter_conditions:
+            pipeline.append({"$match": parse_result.filter_conditions})
+        added: Dict[str, Any] = {}
+        project: Dict[str, Any] = {}
+        sources: Dict[str, str] = {}  # names ORDER BY may use -> sortable field
+        outputs = []
+        for index, item in enumerate(parse_result.select_items):
+            if "computed" in item:
+                expression = parse_result.computed[item["computed"]]
+                hidden = f"__computed{index}"
+                added[hidden] = mongo_expression(expression["unit"], expression["field"])
+                source, text = hidden, item["computed"]
+            else:
+                source = text = item["field"]
+            output = item["alias"] or text
+            project[output] = f"${source}"
+            sources[output] = sources[text] = sources[text.upper()] = source
+            outputs.append(output)
+        if "_id" not in project:
+            project["_id"] = 0
+        if added:
+            pipeline.append({"$addFields": added})
+        sort = {}
+        for spec in parse_result.sort_fields:
+            for name, direction in spec.items():
+                sort[sources.get(name, sources.get(name.upper(), name))] = direction
+        if sort:
+            pipeline.append({"$sort": sort})
+        pipeline.append({"$project": project})
+        builder.skip(parse_result.offset_value).limit(parse_result.limit_value)
+        builder._execution_plan.is_aggregate_query = True
+        builder._execution_plan.aggregate_parameterized = True
+        builder._execution_plan.aggregate_pipeline = json_util.dumps(pipeline)
+        builder._execution_plan.aggregate_options = json.dumps({})
+        builder._execution_plan.projection_stage = {name: 1 for name in outputs}
+        return builder.build()
+
+    @staticmethod
+    def _aggregate_source(func_info: Dict[str, Any], key: str, index: int) -> Any:
+        """$project expression for an accumulator: the value, or the reduced DISTINCT set.
+
+        SUM of no (non-NULL) values is NULL, not $sum's 0.
+        """
+        if not func_info.get("distinct"):
+            if func_info["function"] == "SUM":
+                return {"$cond": [{"$gt": [f"$__numbers{index}", 0]}, f"${key}", None]}
+            return f"${key}"
+        # SQL ignores NULL in DISTINCT aggregates
+        values = {"$setDifference": [f"${key}", [None]]}
+        reducer = {"COUNT": "$size", "SUM": "$sum", "AVG": "$avg", "MIN": "$min", "MAX": "$max"}
+        if func_info["function"] == "SUM":
+            numbers = {"$filter": {"input": values, "cond": {"$isNumber": "$$this"}}}
+            return {"$cond": [{"$gt": [{"$size": numbers}, 0]}, {"$sum": values}, None]}
+        return {reducer[func_info["function"]]: values}
+
+    @staticmethod
+    def _translate_having(parse_result: "QueryParseResult", group_keys: Dict[str, str], hidden: Dict[str, Any]) -> Any:
+        """Translate HAVING into a $match on the grouped outputs (SQL three-valued logic)."""
+        from .partiql.PartiQLParser import PartiQLParser
+        from .query_handler import SelectHandler
+        from .where_tree import _PATH_NODES, WhereTreeBuilder, _field_path
+
+        prefixes = [f"{q}." for q in (parse_result.collection_alias, parse_result.collection) if q]
+
+        def strip(name: str) -> str:
+            for prefix in prefixes:
+                if name.startswith(prefix) and len(name) > len(prefix):
+                    return name[len(prefix) :]
+            return name
+
+        outputs = {}
+        for item in parse_result.select_items:
+            if "aggregate" in item:
+                info = parse_result.aggregate_functions[item["aggregate"]]
+                outputs[(info["function"], info["argument"], bool(info.get("distinct")))] = info["alias"]
+            else:
+                name = item.get("field") or item["computed"]
+                outputs[name] = item["alias"] or name
+        aliases = set(outputs.values())
+
+        def resolve(node: Any) -> Any:
+            if isinstance(node, (PartiQLParser.CountAllContext, PartiQLParser.AggregateBaseContext)):
+                kind, detail = SelectHandler._classify_item(node)
+                if kind != "aggregate":
+                    raise ValueError(f"Unsupported aggregate in HAVING: {node.getText()}")
+                func, arg, distinct = detail
+                signature = (func, strip(arg) if arg != "*" else arg, distinct)
+                if signature in outputs:
+                    return outputs[signature]
+                name = f"__having{len(hidden)}"
+                parse_result.aggregate_functions.append(
+                    {"function": func, "argument": signature[1], "distinct": distinct, "alias": name, "expression": ""}
+                )
+                hidden[name] = len(parse_result.aggregate_functions) - 1
+                outputs[signature] = name
+                return name
+            if isinstance(node, _PATH_NODES):
+                name = strip(_field_path(node))
+                if name in aliases:
+                    return name
+                if name in outputs:
+                    return outputs[name]
+                if name in group_keys:
+                    hidden_name = f"__having{len(hidden)}"
+                    hidden[hidden_name] = f"$_id.{group_keys[name]}"
+                    outputs[name] = hidden_name
+                    return hidden_name
+                raise ValueError(f"HAVING column '{name}' must be grouped, aggregated or a SELECT alias")
+            return None
+
+        return WhereTreeBuilder(resolver=resolve).build(parse_result.having)
+
+    @staticmethod
     def _build_sql_aggregate_plan(parse_result: "QueryParseResult") -> "QueryExecutionPlan":
-        """Build an aggregate execution plan from SQL aggregate functions like COUNT(*), SUM(), etc."""
+        """Build an aggregate execution plan from SQL aggregate functions and GROUP BY.
+
+        Pipeline: $match (WHERE), $group (GROUP BY keys as _id, one accumulator per
+        aggregate), $project (SELECT list, in order, under its output names), then
+        $sort, $skip and $limit on those output names.
+        """
+        from ..error import NotSupportedError
+
         _FUNCTION_TO_ACCUMULATOR = {
             "COUNT": "$sum",
             "SUM": "$sum",
@@ -153,37 +341,144 @@ class ExecutionPlanBuilder:
         if parse_result.filter_conditions:
             pipeline.append({"$match": parse_result.filter_conditions})
 
-        # Build $group stage from aggregate functions
-        group_stage = {"_id": None}
-        for func_info in parse_result.aggregate_functions:
-            alias = func_info["alias"]
+        from ..superset_mongodb.time_grain import mongo_expression
+
+        group_keys = {name: f"g{i}" for i, name in enumerate(parse_result.group_by)}
+
+        def key_source(name: str) -> Any:
+            computed = parse_result.computed.get(name)
+            return mongo_expression(computed["unit"], computed["field"]) if computed else f"${name}"
+
+        group_stage = {"_id": {key: key_source(name) for name, key in group_keys.items()} if group_keys else None}
+
+        # HAVING may name select-list outputs, grouped columns or aggregates; the ones
+        # not in the SELECT list are computed as hidden outputs and removed afterwards.
+        hidden: Dict[str, Any] = {}
+        having_filter = None
+        if parse_result.having is not None:
+            having_filter = ExecutionPlanBuilder._translate_having(parse_result, group_keys, hidden)
+
+        # ORDER BY may name an aggregate that is not selected (e.g. a top-N query ordered
+        # by another metric); it is computed as a hidden output like HAVING's.
+        order_outputs: Dict[str, str] = {}
+        prefixes = [f"{q}." for q in (parse_result.collection_alias, parse_result.collection) if q]
+        for text, (func, arg, distinct) in parse_result.sort_aggregates.items():
+            for prefix in prefixes:
+                if arg.startswith(prefix) and len(arg) > len(prefix):
+                    arg = arg[len(prefix) :]
+            selected = [
+                info["alias"]
+                for info in parse_result.aggregate_functions
+                if (info["function"], info["argument"], bool(info.get("distinct"))) == (func, arg, distinct)
+                and not info["alias"].startswith("__")
+            ]
+            if selected:
+                order_outputs[text] = selected[0]
+                continue
+            name = f"__order{len(order_outputs)}"
+            parse_result.aggregate_functions.append(
+                {"function": func, "argument": arg, "distinct": distinct, "alias": name, "expression": ""}
+            )
+            hidden[name] = len(parse_result.aggregate_functions) - 1
+            order_outputs[text] = name
+
+        accumulator_keys = []
+        for i, func_info in enumerate(parse_result.aggregate_functions):
             func_name = func_info["function"]
             arg = func_info["argument"]
             accumulator = _FUNCTION_TO_ACCUMULATOR[func_name]
+            # $group output names may not contain "." or start with "$", nor repeat
+            key = func_info["alias"]
+            if func_info.get("distinct") or "." in key or key.startswith("$") or key == "_id" or key in group_stage:
+                key = f"__agg{i}"
+            accumulator_keys.append(key)
 
-            if func_name == "COUNT":
-                group_stage[alias] = {accumulator: 1}
+            if func_info.get("distinct"):
+                # Collect the distinct values; the $project stage reduces the set
+                group_stage[key] = {"$addToSet": f"${arg}"}
+            elif func_name == "COUNT" and arg == "*":
+                group_stage[key] = {accumulator: 1}
+            elif func_name == "COUNT":
+                # COUNT(field) counts documents where the field is present and not null
+                group_stage[key] = {"$sum": {"$cond": [{"$gt": [f"${arg}", None]}, 1, 0]}}
             else:
-                group_stage[alias] = {accumulator: f"${arg}"}
+                group_stage[key] = {accumulator: f"${arg}"}
+                if func_name == "SUM":
+                    # $sum of no numbers is 0; SQL's SUM of no values is NULL
+                    group_stage[f"__numbers{i}"] = {"$sum": {"$cond": [{"$isNumber": f"${arg}"}, 1, 0]}}
 
-        pipeline.append({"$group": group_stage})
+        if group_keys:
+            pipeline.append({"$group": group_stage})
+        else:
+            # An aggregate without GROUP BY returns one row even for no input rows
+            # (COUNT 0, other aggregates NULL); $group alone would return none.
+            empty = {"_id": None}
+            for name, accumulator_spec in group_stage.items():
+                if name != "_id":
+                    operator = next(iter(accumulator_spec))
+                    empty[name] = {"$sum": 0, "$addToSet": []}.get(operator)
+            pipeline.append({"$facet": {"row": [{"$group": group_stage}]}})
+            pipeline.append(
+                {"$project": {"row": {"$cond": [{"$eq": [{"$size": "$row"}, 0]}, {"$literal": [empty]}, "$row"]}}}
+            )
+            pipeline.append({"$unwind": "$row"})
+            pipeline.append({"$replaceRoot": {"newRoot": "$row"}})
 
-        # Add $project to exclude _id
+        # Map every SELECT item, in order, to its output name and source
         project_stage = {"_id": 0}
-        for func_info in parse_result.aggregate_functions:
-            project_stage[func_info["alias"]] = 1
+        outputs = []
+        output_for = {}  # names ORDER BY may use -> output name
+        for item in parse_result.select_items:
+            if "aggregate" in item:
+                func_info = parse_result.aggregate_functions[item["aggregate"]]
+                output, key = func_info["alias"], accumulator_keys[item["aggregate"]]
+                source = ExecutionPlanBuilder._aggregate_source(func_info, key, item["aggregate"])
+                if source == f"${key}" and key == output:
+                    source = 1
+                output_for[func_info["expression"].upper()] = output
+            else:
+                name = item.get("field") or item["computed"]
+                if name not in group_keys:
+                    raise NotSupportedError(f"Column '{name}' must appear in GROUP BY or in an aggregate function")
+                output, source = item["alias"] or name, f"$_id.{group_keys[name]}"
+                output_for[name] = output
+            output_for[output] = output
+            project_stage[output] = source
+            outputs.append(output)
+        for name, source in hidden.items():
+            if isinstance(source, int):  # a hidden aggregate: index into aggregate_functions
+                project_stage[name] = ExecutionPlanBuilder._aggregate_source(
+                    parse_result.aggregate_functions[source], accumulator_keys[source], source
+                )
+            else:
+                project_stage[name] = source
         pipeline.append({"$project": project_stage})
+        if having_filter is not None:
+            pipeline.append({"$match": having_filter})
+
+        sort_stage = {}
+        for spec in parse_result.sort_fields:
+            for name, direction in spec.items():
+                output = output_for.get(name, output_for.get(name.upper(), order_outputs.get(name)))
+                if output is None:
+                    raise NotSupportedError(f"ORDER BY '{name}' must name a selected column or its alias")
+                sort_stage[output] = direction
+        if sort_stage:
+            pipeline.append({"$sort": sort_stage})
+        if hidden:
+            pipeline.append({"$project": {name: 0 for name in hidden}})
+        # OFFSET/LIMIT (integers or parameters) are applied by the executor after binding
+        builder.skip(parse_result.offset_value).limit(parse_result.limit_value)
 
         # Configure the execution plan as an aggregate query
         builder._execution_plan.is_aggregate_query = True
-        builder._execution_plan.aggregate_pipeline = json.dumps(pipeline)
+        builder._execution_plan.aggregate_parameterized = True
+        # Extended JSON keeps Decimal128/datetime literals and parameter markers intact
+        builder._execution_plan.aggregate_pipeline = json_util.dumps(pipeline)
         builder._execution_plan.aggregate_options = json.dumps({})
 
-        # Set projection for ResultSet description
-        agg_projection = {}
-        for func_info in parse_result.aggregate_functions:
-            agg_projection[func_info["alias"]] = 1
-        builder._execution_plan.projection_stage = agg_projection
+        # Set projection for ResultSet description, in SELECT order
+        builder._execution_plan.projection_stage = {name: 1 for name in outputs}
 
         plan = builder.build()
         return plan
@@ -212,6 +507,11 @@ class ExecutionPlanBuilder:
     @staticmethod
     def _build_delete_plan(parse_result: "DeleteParseResult") -> "DeleteExecutionPlan":
         """Build a DELETE execution plan from DELETE parsing."""
+        from ..error import SqlSyntaxError
+
+        if parse_result.has_errors:
+            # An untranslated WHERE must never become an empty filter (every document)
+            raise SqlSyntaxError(parse_result.error_message or "DELETE parsing failed")
         _logger.debug(
             f"Building DELETE plan with collection: {parse_result.collection}, "
             f"filters: {parse_result.filter_conditions}"
@@ -226,6 +526,11 @@ class ExecutionPlanBuilder:
     @staticmethod
     def _build_update_plan(parse_result: "UpdateParseResult") -> "UpdateExecutionPlan":
         """Build an UPDATE execution plan from UPDATE parsing."""
+        from ..error import SqlSyntaxError
+
+        if parse_result.has_errors:
+            # An untranslated WHERE must never become an empty filter (every document)
+            raise SqlSyntaxError(parse_result.error_message or "UPDATE parsing failed")
         _logger.debug(
             f"Building UPDATE plan with collection: {parse_result.collection}, "
             f"update_fields: {parse_result.update_fields}, "

@@ -41,6 +41,14 @@ def _run_db_command(db: Any, command: Dict[str, Any], connection: Any, operation
     )
 
 
+def _paging(limit: Any, skip: Any) -> Any:
+    """Validate bound LIMIT/OFFSET values; returns (limit, skip)."""
+    for name, value in (("LIMIT", limit), ("OFFSET", skip)):
+        if value is not None and (isinstance(value, bool) or not isinstance(value, int) or value < 0):
+            raise ProgrammingError(f"{name} must be a non-negative integer, got {value!r}")
+    return limit, skip
+
+
 @dataclass
 class ExecutionContext:
     """Manages execution context for a single query"""
@@ -149,9 +157,16 @@ class StandardQueryExecution(ExecutionStrategy):
             # Replace placeholders with parameters in filter_stage only (not in projection)
             filter_stage = execution_plan.filter_stage or {}
 
-            if parameters:
-                # Positional parameters with ? (named parameters are converted to positional in execute())
-                filter_stage = self._replace_placeholders(filter_stage, parameters)
+            # Positional parameters (named ones are converted to positional in execute()),
+            # in statement order: WHERE, then LIMIT, then OFFSET
+            bound, _ = SQLHelper.bind_filter(
+                {"filter": filter_stage, "limit": execution_plan.limit_stage, "skip": execution_plan.skip_stage},
+                parameters,
+            )
+            filter_stage = bound["filter"]
+            limit, skip = _paging(bound["limit"], bound["skip"])
+            if limit == 0:
+                return {"cursor": {"id": 0, "firstBatch": []}, "ok": 1}
 
             projection_stage = execution_plan.projection_stage or {}
 
@@ -170,13 +185,11 @@ class StandardQueryExecution(ExecutionStrategy):
                         sort_spec[field_name] = direction
                 find_command["sort"] = sort_spec
 
-            # Apply skip if specified
-            if execution_plan.skip_stage:
-                find_command["skip"] = execution_plan.skip_stage
-
-            # Apply limit if specified
-            if execution_plan.limit_stage:
-                find_command["limit"] = execution_plan.limit_stage
+            # Apply skip and limit if specified (MongoDB reads limit 0 as "no limit")
+            if skip:
+                find_command["skip"] = skip
+            if limit is not None:
+                find_command["limit"] = limit
 
             _logger.debug(f"Executing MongoDB command: {find_command}")
 
@@ -223,7 +236,12 @@ class StandardQueryExecution(ExecutionStrategy):
 
             # Parse pipeline and options from JSON strings
             try:
-                pipeline = json.loads(execution_plan.aggregate_pipeline or "[]")
+                if execution_plan.aggregate_parameterized:
+                    from bson import json_util
+
+                    pipeline = json_util.loads(execution_plan.aggregate_pipeline or "[]")
+                else:
+                    pipeline = json.loads(execution_plan.aggregate_pipeline or "[]")
                 options = json.loads(execution_plan.aggregate_options or "{}")
             except json.JSONDecodeError as e:
                 raise ProgrammingError(f"Invalid JSON in aggregate pipeline or options: {e}")
@@ -231,6 +249,14 @@ class StandardQueryExecution(ExecutionStrategy):
             _logger.debug(f"Executing aggregate on collection {execution_plan.collection}")
             _logger.debug(f"Pipeline: {pipeline}")
             _logger.debug(f"Options: {options}")
+
+            # A pipeline generated from SQL carries parameter markers (WHERE, HAVING), then
+            # LIMIT and OFFSET
+            limit, skip = execution_plan.limit_stage, execution_plan.skip_stage
+            if execution_plan.aggregate_parameterized:
+                bound, _ = SQLHelper.bind_filter({"pipeline": pipeline, "limit": limit, "skip": skip}, parameters)
+                pipeline, limit, skip = bound["pipeline"], bound["limit"], bound["skip"]
+            limit, skip = _paging(limit, skip)
 
             # Get collection and call aggregate()
             collection = db[execution_plan.collection]
@@ -258,11 +284,11 @@ class StandardQueryExecution(ExecutionStrategy):
                         results = sorted(results, key=lambda x: x.get(field_name), reverse=reverse)
 
             # Apply skip and limit
-            if execution_plan.skip_stage:
-                results = results[execution_plan.skip_stage :]
+            if skip:
+                results = results[skip:]
 
-            if execution_plan.limit_stage:
-                results = results[: execution_plan.limit_stage]
+            if limit is not None:
+                results = results[:limit]
 
             # Apply projection if specified
             if execution_plan.projection_stage:
@@ -513,11 +539,8 @@ class DeleteExecution(ExecutionStrategy):
 
             filter_conditions = execution_plan.filter_conditions or {}
 
-            # Replace placeholders in filter if parameters provided
-            if parameters and filter_conditions:
-                filter_conditions = SQLHelper.replace_placeholders_generic(
-                    filter_conditions, parameters, execution_plan.parameter_style
-                )
+            # Bind the WHERE clause's parameter markers; every parameter must be used
+            filter_conditions, _ = SQLHelper.bind_filter(filter_conditions, parameters)
 
             command = {"delete": execution_plan.collection, "deletes": [{"q": filter_conditions, "limit": 0}]}
 
@@ -600,12 +623,10 @@ class UpdateExecution(ExecutionStrategy):
             # Replace placeholders if parameters provided
             # Note: We need to replace both update_fields and filter_conditions in one pass
             # to maintain correct parameter ordering (SET clause first, then WHERE clause)
-            if parameters:
-                # Combine structures for replacement in correct order
-                combined = {"update_fields": update_fields, "filter_conditions": filter_conditions}
-                replaced = SQLHelper.replace_placeholders_generic(combined, parameters, execution_plan.parameter_style)
-                update_fields = replaced["update_fields"]
-                filter_conditions = replaced["filter_conditions"]
+            # SET values and the WHERE clause carry parameter markers; bind them in
+            # statement order (SET first) and require every parameter to be used
+            bound, _ = SQLHelper.bind_filter({"u": update_fields, "q": filter_conditions}, parameters)
+            update_fields, filter_conditions = bound["u"], bound["q"]
 
             # MongoDB update command format
             # https://www.mongodb.com/docs/manual/reference/command/update/

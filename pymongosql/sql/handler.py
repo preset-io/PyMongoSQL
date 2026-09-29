@@ -53,6 +53,13 @@ class ContextUtilsMixin:
         return hasattr(ctx, "children") and bool(ctx.children)
 
     @staticmethod
+    def unquote_identifier(name: Optional[str]) -> Optional[str]:
+        """Strip the double quotes of a quoted SQL identifier (``"count"`` -> ``count``)."""
+        if isinstance(name, str) and len(name) >= 2 and name.startswith('"') and name.endswith('"'):
+            return name[1:-1].replace('""', '"')
+        return name
+
+    @staticmethod
     def normalize_field_path(path: str) -> str:
         """Normalize jmspath/bracket notation to MongoDB dot notation.
 
@@ -144,10 +151,10 @@ class OperatorExtractorMixin:
         # Remove parentheses from values
         value_text = value_text.strip("()")
 
-        # Remove quotes from string values
-        if (value_text.startswith("'") and value_text.endswith("'")) or (
-            value_text.startswith('"') and value_text.endswith('"')
-        ):
+        # Remove quotes from string values; SQL escapes a quote by doubling it
+        if len(value_text) >= 2 and value_text.startswith("'") and value_text.endswith("'"):
+            return value_text[1:-1].replace("''", "'")
+        if len(value_text) >= 2 and value_text.startswith('"') and value_text.endswith('"'):
             return value_text[1:-1]
 
         # Try to parse as number
@@ -250,19 +257,27 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
         if operator == "=":
             return {field_name: value}
 
+        # SQL <>, NOT IN and NOT LIKE are never TRUE for a NULL or missing field
+        if operator in ("!=", "<>", "NOT IN", "NOT LIKE") or (operator == "LIKE" and value == "?"):
+            from .where_tree import leaf_filters
+
+            return leaf_filters(field_name, operator, value)[0]
+
         # Handle special operators
-        if operator == "IN":
-            return {field_name: {"$in": value if isinstance(value, list) else [value]}}
-        elif operator == "LIKE":
+        if operator in ("IN", "NOT IN"):
+            values = value if isinstance(value, list) else [value]
+            return {field_name: {"$in" if operator == "IN" else "$nin": values}}
+        elif operator in ("LIKE", "NOT LIKE"):
             # Convert SQL LIKE pattern to regex
             if isinstance(value, str):
-                # Replace % with .* and _ with . for regex
-                regex_pattern = value.replace("%", ".*").replace("_", ".")
+                regex_pattern = self._like_to_regex(value)
                 # Add anchors based on pattern
                 if not regex_pattern.startswith(".*"):
                     regex_pattern = "^" + regex_pattern
                 if not regex_pattern.endswith(".*"):
                     regex_pattern = regex_pattern + "$"
+                if operator == "NOT LIKE":
+                    return {field_name: {"$not": {"$regex": regex_pattern}}}
                 return {field_name: {"$regex": regex_pattern}}
             return {field_name: value}
         elif operator == "BETWEEN":
@@ -286,6 +301,26 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
             # Fallback to equality
             _logger.warning(f"Unknown operator '{operator}', falling back to equality")
             return {field_name: value}
+
+    @staticmethod
+    def _like_to_regex(pattern: str) -> str:
+        """Translate a LIKE pattern, escaping every other regex metacharacter."""
+        return "".join(".*" if c == "%" else "." if c == "_" else re.escape(c) for c in pattern)
+
+    def _negated_keyword(self, ctx: Any, text: str, keyword: str) -> bool:
+        """Whether ``keyword`` (IN( or LIKE) is preceded by NOT.
+
+        getText() drops whitespace, so ``a NOT IN (1)`` reads ``aNOTIN(1)``. Use the
+        parse tree when there is one; otherwise require the upper-case NOT that
+        generated SQL uses, so a field such as ``cannot`` is not misread.
+        """
+        not_method = getattr(ctx, "NOT", None)
+        if callable(not_method) and type(ctx).__name__.startswith("Predicate"):
+            try:
+                return not_method() is not None
+            except Exception:
+                pass
+        return f"NOT{keyword}" in text
 
     def _is_comparison_context(self, ctx: Any) -> bool:
         """Check if context is a comparison based on structure"""
@@ -334,6 +369,8 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
             for keyword in sql_keywords:
                 if keyword in text_upper:
                     idx = text_upper.index(keyword)
+                    if keyword in ("IN(", "LIKE") and self._negated_keyword(ctx, text, keyword):
+                        idx = text.index(f"NOT{keyword}")
                     candidate = text[:idx].strip()
                     return self.normalize_field_path(candidate)
 
@@ -374,6 +411,8 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
 
             for construct, operator in sql_constructs.items():
                 if construct in text_upper:
+                    if construct in ("IN(", "LIKE") and self._negated_keyword(ctx, text, construct):
+                        return f"NOT {operator}"
                     return operator
 
             # Look for comparison operators
@@ -519,13 +558,18 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
 
         end = text.rfind(")")
         if end > start >= 0:
-            values_text = text[start:end]
-            values = []
-            for val in values_text.split(","):
-                cleaned_val = val.strip().strip("'\"")
-                if cleaned_val:  # Skip empty values
-                    values.append(self._parse_value(f"'{cleaned_val}'"))
-            return values
+            # Split on commas outside quoted strings; keep each literal's type
+            values, current, in_quote = [], "", False
+            for char in text[start:end]:
+                if char == "'":
+                    in_quote = not in_quote
+                if char == "," and not in_quote:
+                    values.append(current)
+                    current = ""
+                else:
+                    current += char
+            values.append(current)
+            return [self._extract_value_or_function(v) for v in values if v.strip()]
         return []
 
     def _extract_like_pattern(self, text: str) -> str:
@@ -533,7 +577,7 @@ class ComparisonExpressionHandler(BaseHandler, ContextUtilsMixin, LoggingMixin, 
         idx = text.upper().find("LIKE")
         if idx == -1:
             return ""
-        return text[idx + 4 :].strip().strip("'\"")
+        return self._parse_value(text[idx + 4 :].strip())
 
     def _extract_between_range(self, text: str) -> Optional[Tuple[Any, Any]]:
         """Extract range values from BETWEEN clause"""

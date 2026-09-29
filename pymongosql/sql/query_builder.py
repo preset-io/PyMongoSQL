@@ -22,6 +22,8 @@ class QueryExecutionPlan(ExecutionPlan):
     aggregate_pipeline: Optional[str] = None  # JSON string representation of pipeline
     aggregate_options: Optional[str] = None  # JSON string representation of options
     is_aggregate_query: bool = False  # Flag indicating this is an aggregate() call
+    # True when the pipeline was generated from SQL and may hold ? placeholders
+    aggregate_parameterized: bool = False
 
     def to_dict(self) -> Dict[str, Any]:
         """Convert query plan to dictionary representation"""
@@ -51,10 +53,20 @@ class QueryExecutionPlan(ExecutionPlan):
         else:
             errors = self.validate_base()
 
-        if self.limit_stage is not None and (not isinstance(self.limit_stage, int) or self.limit_stage < 0):
+        from .where_tree import is_param
+
+        if (
+            self.limit_stage is not None
+            and not is_param(self.limit_stage)
+            and (not isinstance(self.limit_stage, int) or self.limit_stage < 0)
+        ):
             errors.append("Limit must be a non-negative integer")
 
-        if self.skip_stage is not None and (not isinstance(self.skip_stage, int) or self.skip_stage < 0):
+        if (
+            self.skip_stage is not None
+            and not is_param(self.skip_stage)
+            and (not isinstance(self.skip_stage, int) or self.skip_stage < 0)
+        ):
             errors.append("Skip must be a non-negative integer")
 
         if errors:
@@ -76,6 +88,7 @@ class QueryExecutionPlan(ExecutionPlan):
             aggregate_pipeline=self.aggregate_pipeline,
             aggregate_options=self.aggregate_options,
             is_aggregate_query=self.is_aggregate_query,
+            aggregate_parameterized=self.aggregate_parameterized,
         )
 
 
@@ -153,18 +166,22 @@ class MongoQueryBuilder:
 
         return self
 
-    def limit(self, count: int) -> "MongoQueryBuilder":
-        """Set limit for results"""
-        if not isinstance(count, int) or count < 0:
+    def limit(self, count: Any) -> "MongoQueryBuilder":
+        """Set limit for results (an integer or a parameter marker bound at execution)"""
+        from .where_tree import is_param
+
+        if not is_param(count) and (not isinstance(count, int) or count < 0):
             return self
 
         self._execution_plan.limit_stage = count
         _logger.debug(f"Set limit to: {count}")
         return self
 
-    def skip(self, count: int) -> "MongoQueryBuilder":
-        """Set skip count for pagination"""
-        if not isinstance(count, int) or count < 0:
+    def skip(self, count: Any) -> "MongoQueryBuilder":
+        """Set skip count for pagination (an integer or a parameter marker bound at execution)"""
+        from .where_tree import is_param
+
+        if not is_param(count) and (not isinstance(count, int) or count < 0):
             return self
 
         self._execution_plan.skip_stage = count

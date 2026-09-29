@@ -4,12 +4,12 @@ from typing import Any, Dict, Union
 
 from ..error import SqlSyntaxError
 from .delete_handler import DeleteParseResult
-from .handler import BaseHandler, HandlerFactory
+from .handler import BaseHandler, ContextUtilsMixin, HandlerFactory
 from .insert_handler import InsertParseResult
 from .partiql.PartiQLLexer import PartiQLLexer
 from .partiql.PartiQLParser import PartiQLParser
 from .partiql.PartiQLParserVisitor import PartiQLParserVisitor
-from .query_handler import QueryParseResult
+from .query_handler import QueryParseResult, SelectHandler
 from .update_handler import UpdateParseResult
 
 _logger = logging.getLogger(__name__)
@@ -275,6 +275,11 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
             if hasattr(ctx, "orderSortSpec") and ctx.orderSortSpec():
                 for sort_spec in ctx.orderSortSpec():
                     field_name = sort_spec.expr().getText() if sort_spec.expr() else "_id"
+                    field_name = ContextUtilsMixin.normalize_field_path(field_name)
+                    if sort_spec.expr() is not None:
+                        kind, detail = SelectHandler._classify_item(sort_spec.expr())
+                        if kind == "aggregate":
+                            self._query_parse_result.sort_aggregates[field_name] = detail
                     # Check for ASC/DESC (default is ASC = 1)
                     direction = 1  # ASC
                     if hasattr(sort_spec, "DESC") and sort_spec.DESC():
@@ -289,39 +294,68 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
             _logger.warning(f"Error processing ORDER BY clause: {e}")
             return self.visitChildren(ctx)
 
+    def visitGroupClause(self, ctx: PartiQLParser.GroupClauseContext) -> Any:
+        """Handle GROUP BY keys; they become the _id of a $group stage."""
+        keys = []
+        for key in ctx.groupKey() or []:
+            if key.symbolPrimitive() is not None:
+                self._query_parse_result.unsupported_clauses.append("GROUP BY key alias")
+            text = ContextUtilsMixin.normalize_field_path(key.exprSelect().getText())
+            try:
+                truncated = SelectHandler.date_trunc(key.exprSelect())
+            except ValueError as e:
+                self._query_parse_result.unsupported_clauses.append(f"GROUP BY {text} ({e})")
+                truncated = None
+            if truncated is not None:
+                self._query_parse_result.computed[text] = truncated
+            keys.append(text)
+        if ctx.PARTIAL() is not None:
+            self._query_parse_result.unsupported_clauses.append("GROUP PARTIAL BY")
+        self._query_parse_result.group_by = keys
+        return None
+
+    def visitHavingClause(self, ctx: PartiQLParser.HavingClauseContext) -> Any:
+        """Keep the HAVING expression; it is translated after the $group stage."""
+        self._query_parse_result.having = ctx.arg
+        return None
+
     def visitLimitClause(self, ctx: PartiQLParser.LimitClauseContext) -> Any:
-        """Handle LIMIT clause for result limiting"""
-        _logger.debug("Processing LIMIT clause")
-        try:
-            if hasattr(ctx, "exprSelect") and ctx.exprSelect():
-                limit_text = ctx.exprSelect().getText()
-                try:
-                    limit_value = int(limit_text)
-                    self._query_parse_result.limit_value = limit_value
-                    _logger.debug(f"Extracted limit value: {limit_value}")
-                except ValueError as e:
-                    _logger.warning(f"Invalid LIMIT value '{limit_text}': {e}")
-            return self.visitChildren(ctx)
-        except Exception as e:
-            _logger.warning(f"Error processing LIMIT clause: {e}")
-            return self.visitChildren(ctx)
+        """Handle LIMIT: a non-negative integer literal or a bound parameter."""
+        from .where_tree import is_param, operand
+
+        if hasattr(ctx, "exprSelect") and ctx.exprSelect():
+            try:
+                value = operand(ctx.exprSelect())
+            except Exception:
+                value = None
+            if is_param(value) or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+                self._query_parse_result.limit_value = value
+            else:
+                # Dropping it would return every row
+                text = ctx.exprSelect().getText()
+                self._query_parse_result.unsupported_clauses.append(
+                    f"LIMIT {text} (needs a non-negative integer or a parameter)"
+                )
+        return None
 
     def visitOffsetByClause(self, ctx: PartiQLParser.OffsetByClauseContext) -> Any:
-        """Handle OFFSET clause for result skipping"""
-        _logger.debug("Processing OFFSET clause")
-        try:
-            if hasattr(ctx, "exprSelect") and ctx.exprSelect():
-                offset_text = ctx.exprSelect().getText()
-                try:
-                    offset_value = int(offset_text)
-                    self._query_parse_result.offset_value = offset_value
-                    _logger.debug(f"Extracted offset value: {offset_value}")
-                except ValueError as e:
-                    _logger.warning(f"Invalid OFFSET value '{offset_text}': {e}")
-            return self.visitChildren(ctx)
-        except Exception as e:
-            _logger.warning(f"Error processing OFFSET clause: {e}")
-            return self.visitChildren(ctx)
+        """Handle OFFSET: a non-negative integer literal or a bound parameter."""
+        from .where_tree import is_param, operand
+
+        if hasattr(ctx, "exprSelect") and ctx.exprSelect():
+            try:
+                value = operand(ctx.exprSelect())
+            except Exception:
+                value = None
+            if is_param(value) or (isinstance(value, int) and not isinstance(value, bool) and value >= 0):
+                self._query_parse_result.offset_value = value
+            else:
+                # Dropping it would return every row
+                text = ctx.exprSelect().getText()
+                self._query_parse_result.unsupported_clauses.append(
+                    f"OFFSET {text} (needs a non-negative integer or a parameter)"
+                )
+        return None
 
     def visitUpdateClause(self, ctx: PartiQLParser.UpdateClauseContext) -> Any:
         """Handle UPDATE clause to extract collection/table name."""
