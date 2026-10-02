@@ -41,6 +41,10 @@ def _run_db_command(db: Any, command: Dict[str, Any], connection: Any, operation
     )
 
 
+# BSON holds a signed 64-bit integer; larger LIMIT/OFFSET values are paged in Python
+_MAX_BSON_INT = 2**63 - 1
+
+
 def _paging(limit: Any, skip: Any) -> Any:
     """Validate bound LIMIT/OFFSET values; returns (limit, skip)."""
     for name, value in (("LIMIT", limit), ("OFFSET", skip)):
@@ -258,10 +262,12 @@ class StandardQueryExecution(ExecutionStrategy):
                 pipeline, limit, skip = bound["pipeline"], bound["limit"], bound["skip"]
             limit, skip = _paging(limit, skip)
 
-            # Page on the server unless rows are still filtered or sorted below. $limit must
-            # be positive, so LIMIT 0 asks for one row and the slice below drops it.
+            # Page on the server unless rows are still filtered or sorted below, or a value
+            # does not fit a BSON int64. $limit must be positive, so LIMIT 0 asks for one
+            # row and the slice below drops it.
             ends_with_output = bool(pipeline) and any(stage in pipeline[-1] for stage in ("$out", "$merge"))
-            if not execution_plan.filter_stage and not execution_plan.sort_stage and not ends_with_output:
+            fits_bson = all(value is None or value <= _MAX_BSON_INT for value in (limit, skip))
+            if not execution_plan.filter_stage and not execution_plan.sort_stage and not ends_with_output and fits_bson:
                 if skip:
                     pipeline = pipeline + [{"$skip": skip}]
                 if limit is not None:

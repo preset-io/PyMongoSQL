@@ -10,6 +10,7 @@
 """
 
 import datetime
+import json
 
 import pytest
 from pymongo import monitoring
@@ -78,6 +79,16 @@ class TestOperatorFieldNames:
         assert where("\"first name\" = 'x'") == {"first name": "x"}
         assert where('"a.b" = 1') == {"a.b": 1}
         assert where('"price$" = 1') == {"price$": 1}
+
+    @pytest.mark.parametrize("key", ['"$ROOT"', '"$where"', '"$expr"', '"$"', 'a."$b"', '"a.$b"', "a['$c']"])
+    def test_group_by_key_is_rejected(self, key):
+        with pytest.raises(Error):
+            plan(f"SELECT COUNT(*) AS c FROM t GROUP BY {key}")
+
+    def test_group_by_names_without_leading_dollar_still_work(self):
+        for key, field in (('"price$"', "price$"), ('"a$b"', "a$b"), ('"first name"', "first name")):
+            pipeline = json.loads(plan(f"SELECT COUNT(*) AS c FROM t GROUP BY {key}").aggregate_pipeline)
+            assert pipeline[0]["$group"]["_id"] == {"g0": f"${field}"}
 
 
 OPERATOR_COLLECTION = "test_operator_fields"
@@ -292,6 +303,40 @@ class TestLiveAggregatePaging:
         sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s OFFSET 498"
         assert rows(conn, sql) == [("k498", 1), ("k499", 1)]
         assert listener.returned == 2
+
+    @pytest.mark.parametrize("huge", [2**63, 2**63 + 5, 2**70])
+    def test_limit_beyond_int64_pages_in_python(self, paging, huge):
+        conn, listener = paging
+        sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT {huge}"
+        assert len(rows(conn, sql)) == PAGING_DOCS
+        assert not any("$limit" in stage or "$skip" in stage for stage in listener.pipelines[-1])
+
+    @pytest.mark.parametrize("huge", [2**63, 2**70])
+    def test_offset_beyond_int64_pages_in_python(self, paging, huge):
+        conn, listener = paging
+        sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT 3 OFFSET {huge}"
+        assert rows(conn, sql) == []
+        assert not any("$limit" in stage or "$skip" in stage for stage in listener.pipelines[-1])
+
+    def test_bound_values_beyond_int64_page_in_python(self, paging):
+        conn, listener = paging
+        sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT ? OFFSET ?"
+        assert len(rows(conn, sql, [2**63, 497])) == 3
+        assert rows(conn, sql, [3, 2**63]) == []
+        assert not any("$limit" in stage or "$skip" in stage for stage in listener.pipelines[-1])
+
+    def test_int64_maximum_is_still_pushed_down(self, paging):
+        conn, listener = paging
+        top = 2**63 - 1
+        sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT {top} OFFSET 497"
+        assert rows(conn, sql) == [("k497", 1), ("k498", 1), ("k499", 1)]
+        assert listener.pipelines[-1][-2:] == [{"$skip": 497}, {"$limit": top}]
+        assert listener.returned == 3
+        assert (
+            rows(conn, f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT 1 OFFSET {top}")
+            == []
+        )
+        assert listener.pipelines[-1][-2:] == [{"$skip": top}, {"$limit": 1}]
 
     def test_no_limit_returns_every_group(self, paging):
         conn, listener = paging

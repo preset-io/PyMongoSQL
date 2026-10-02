@@ -11,6 +11,7 @@ from .partiql.PartiQLParser import PartiQLParser
 from .partiql.PartiQLParserVisitor import PartiQLParserVisitor
 from .query_handler import QueryParseResult, SelectHandler
 from .update_handler import UpdateParseResult
+from .where_tree import _checked_path
 
 _logger = logging.getLogger(__name__)
 
@@ -308,6 +309,8 @@ class MongoSQLParserVisitor(PartiQLParserVisitor):
                 truncated = None
             if truncated is not None:
                 self._query_parse_result.computed[text] = truncated
+            else:
+                _checked_path(text)
             keys.append(text)
         if ctx.PARTIAL() is not None:
             self._query_parse_result.unsupported_clauses.append("GROUP PARTIAL BY")
