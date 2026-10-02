@@ -125,19 +125,25 @@ def _has_inexact(value: Any) -> bool:
     return isinstance(value, _InexactDecimal)
 
 
-def _all(parts: List[Tuple[Any, Filter]], key: str, chain: type) -> Filter:
-    """Combine filters under ``key``, flattening only an unparenthesized chain of the same operator."""
-    items: List[Filter] = []
-    for ctx, f in parts:
-        items.extend(f[key] if isinstance(ctx, chain) and list(f) == [key] else [f])
-    return {key: items}
-
-
 def contains_not(ctx: Any) -> bool:
     """Whether the expression has a boolean NOT (not a NOT IN / NOT LIKE predicate)."""
     if isinstance(ctx, PartiQLParser.NotContext):
         return True
     return any(contains_not(child) for child in getattr(ctx, "children", None) or [])
+
+
+_BOOLEAN = (PartiQLParser.NotContext, PartiQLParser.AndContext, PartiQLParser.OrContext)
+# Operator tokens of a boolean expression read in token order
+_NOT, _AND, _OR = object(), object(), object()
+
+
+def _swallows_chain(ctx: Any) -> bool:
+    """Whether a LIKE's ESCAPE expression took the AND/OR chain that follows it."""
+    return (
+        isinstance(ctx, PartiQLParser.PredicateLikeContext)
+        and ctx.escape is not None
+        and isinstance(_unwrap(ctx.escape), (PartiQLParser.AndContext, PartiQLParser.OrContext))
+    )
 
 
 def _unwrap(ctx: Any) -> Any:
@@ -349,30 +355,18 @@ class WhereTreeBuilder:
     def build(self, ctx: Any) -> Filter:
         return self._pair(ctx)[0]
 
-    def _pair(self, ctx: Any, substitute: Optional[Tuple[Any, Pair]] = None) -> Pair:
-        if substitute is not None and ctx is substitute[0]:
-            return substitute[1]
-        if isinstance(ctx, PartiQLParser.NotContext):
-            true, false = self._pair(ctx.rhs, substitute)
-            return false, true
-        if isinstance(ctx, (PartiQLParser.AndContext, PartiQLParser.OrContext)):
-            is_and = isinstance(ctx, PartiQLParser.AndContext)
-            (t1, f1), (t2, f2) = self._pair(ctx.lhs, substitute), self._pair(ctx.rhs, substitute)
-            true_key, false_key = ("$and", "$or") if is_and else ("$or", "$and")
-            chain = type(ctx)
-            return (
-                _all([(ctx.lhs, t1), (ctx.rhs, t2)], true_key, chain),
-                _all([(ctx.lhs, f1), (ctx.rhs, f2)], false_key, chain),
-            )
+    def _pair(self, ctx: Any) -> Pair:
+        if isinstance(ctx, _BOOLEAN) or _swallows_chain(ctx):
+            return self._chain(ctx)
         if isinstance(ctx, PartiQLParser.ExprTermWrappedQueryContext):
-            return self._pair(ctx.expr(), substitute)
+            return self._pair(ctx.expr())
         if isinstance(ctx, PartiQLParser.PredicateLikeContext):
             return self._like(ctx)
         if isinstance(ctx, _LEAVES):
             return self._leaf(ctx)
         children = [c for c in getattr(ctx, "children", None) or [] if hasattr(c, "getRuleIndex")]
         if len(children) == 1 and len(ctx.children) == 1:
-            return self._pair(children[0], substitute)
+            return self._pair(children[0])
         if isinstance(ctx, _PATH_NODES):
             # A bare boolean field: WHERE flag / WHERE NOT flag
             field = str(operand(ctx, self._resolver))
@@ -429,7 +423,7 @@ class WhereTreeBuilder:
                 return node.expr()[0]
         return None
 
-    def _like(self, ctx: Any) -> Pair:
+    def _like(self, ctx: Any, escape_ctx: Any = None) -> Pair:
         lhs, rhs, case_insensitive = ctx.lhs, ctx.rhs, False
         folded_lhs, folded_rhs = self._case_folded(ctx.lhs), self._case_folded(ctx.rhs)
         if folded_lhs is not None:
@@ -442,16 +436,81 @@ class WhereTreeBuilder:
         op = ("NOT " if ctx.NOT() is not None else "") + ("ILIKE" if case_insensitive else "LIKE")
         if ctx.escape is None:
             return leaf_filters(field, op, pattern)
-        # The grammar lets ESCAPE take a whole expression, so "a LIKE p ESCAPE '/' AND b = 1"
-        # parses the AND chain as the escape. Its leftmost operand is the escape character;
-        # the LIKE predicate takes that operand's place in the chain.
-        leftmost = _unwrap(ctx.escape)
-        while isinstance(leftmost, (PartiQLParser.AndContext, PartiQLParser.OrContext)):
-            leftmost = _unwrap(leftmost.lhs)
-        escape = _value(leftmost, self._resolver)
+        escape = _value(ctx.escape if escape_ctx is None else escape_ctx, self._resolver)
         if not isinstance(escape, str) or len(escape) != 1:
             raise NotSupportedError(f"LIKE ESCAPE must be a single character: {ctx.getText()}")
-        like = leaf_filters(field, op, pattern, escape)
-        if leftmost is _unwrap(ctx.escape):
-            return like
-        return self._pair(ctx.escape, substitute=(leftmost, like))
+        return leaf_filters(field, op, pattern, escape)
+
+    def _chain(self, ctx: Any) -> Pair:
+        """NOT, AND and OR read in token order and grouped with SQL precedence.
+
+        The grammar lets ESCAPE take a whole expression, so in
+        ``a = 1 AND b LIKE p ESCAPE '/' OR c = 2`` the escape is ``'/' OR c = 2``. In
+        token order the operators are still right, so grouping them again (NOT binds
+        tightest, then AND, then OR) gives ``(a = 1 AND b LIKE p) OR c = 2``.
+        """
+        items: List[Any] = []
+        self._tokens(ctx, items)
+        position = 0
+
+        def take() -> Any:
+            nonlocal position
+            if position >= len(items) or items[position] is _AND or items[position] is _OR:
+                raise NotSupportedError(f"Unsupported WHERE expression: {ctx.getText()}")
+            position += 1
+            return items[position - 1]
+
+        def term() -> Pair:
+            item = take()
+            if item is _NOT:
+                true, false = term()
+                return false, true
+            return item if isinstance(item, tuple) else self._pair(item)
+
+        def series(operator: Any, next_term: Any) -> Pair:
+            nonlocal position
+            pairs = [next_term()]
+            while position < len(items) and items[position] is operator:
+                position += 1
+                pairs.append(next_term())
+            if len(pairs) == 1:
+                return pairs[0]
+            true_key, false_key = ("$and", "$or") if operator is _AND else ("$or", "$and")
+            return {true_key: [t for t, _ in pairs]}, {false_key: [f for _, f in pairs]}
+
+        result = series(_OR, lambda: series(_AND, term))
+        if position != len(items):
+            raise NotSupportedError(f"Unsupported WHERE expression: {ctx.getText()}")
+        return result
+
+    def _tokens(self, ctx: Any, out: List[Any]) -> None:
+        """Append the boolean structure of ``ctx`` in token order: NOT, AND, OR and operands.
+
+        An operand is a parse node (a predicate or a parenthesized expression, grouped on
+        its own) or the Pair of a LIKE whose ESCAPE took the rest of the chain.
+        """
+        node = ctx
+        while True:
+            if isinstance(node, PartiQLParser.NotContext):
+                out.append(_NOT)
+                self._tokens(node.rhs, out)
+                return
+            if isinstance(node, (PartiQLParser.AndContext, PartiQLParser.OrContext)):
+                self._tokens(node.lhs, out)
+                out.append(_AND if isinstance(node, PartiQLParser.AndContext) else _OR)
+                self._tokens(node.rhs, out)
+                return
+            if _swallows_chain(node):
+                rest: List[Any] = []
+                self._tokens(node.escape, rest)
+                if not hasattr(rest[0], "getRuleIndex"):
+                    raise NotSupportedError(f"LIKE ESCAPE must be a single character: {node.getText()}")
+                out.append(self._like(node, escape_ctx=rest[0]))
+                out.extend(rest[1:])
+                return
+            children = getattr(node, "children", None) or []
+            if len(children) == 1 and hasattr(children[0], "getRuleIndex"):
+                node = children[0]
+                continue
+            out.append(node)
+            return
