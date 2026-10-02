@@ -258,6 +258,16 @@ class StandardQueryExecution(ExecutionStrategy):
                 pipeline, limit, skip = bound["pipeline"], bound["limit"], bound["skip"]
             limit, skip = _paging(limit, skip)
 
+            # Page on the server unless rows are still filtered or sorted below. $limit must
+            # be positive, so LIMIT 0 asks for one row and the slice below drops it.
+            ends_with_output = bool(pipeline) and any(stage in pipeline[-1] for stage in ("$out", "$merge"))
+            if not execution_plan.filter_stage and not execution_plan.sort_stage and not ends_with_output:
+                if skip:
+                    pipeline = pipeline + [{"$skip": skip}]
+                if limit is not None:
+                    pipeline = pipeline + [{"$limit": max(limit, 1)}]
+                skip = None
+
             # Get collection and call aggregate()
             collection = db[execution_plan.collection]
 

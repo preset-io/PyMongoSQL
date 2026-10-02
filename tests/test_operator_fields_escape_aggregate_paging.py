@@ -1,17 +1,22 @@
 # -*- coding: utf-8 -*-
-"""Quoted operator names and LIKE ... ESCAPE precedence.
+"""Quoted operator names, LIKE ... ESCAPE precedence and paging of aggregation pipelines.
 
 - A field name starting with ``$`` is rejected whether or not it is quoted, so
   ``"$where"`` or ``"$expr"`` can never reach MongoDB as a query operator.
 - ``LIKE ... ESCAPE`` keeps SQL precedence for the conditions that follow it: the
   grammar parses the rest of the boolean chain as the escape expression.
+- LIMIT and OFFSET of a GROUP BY, aggregate or DATE_TRUNC query become ``$skip`` and
+  ``$limit`` stages, so the server returns only the requested page.
 """
 
+import datetime
+
 import pytest
+from pymongo import monitoring
 
 from pymongosql.error import Error
 from pymongosql.sql.parser import SQLParser
-from tests.conftest import HAS_SQLALCHEMY
+from tests.conftest import HAS_SQLALCHEMY, make_conn, make_superset_conn
 
 if HAS_SQLALCHEMY:
     import sqlalchemy as sa
@@ -191,3 +196,124 @@ class TestLiveEscapePrecedence:
             assert list(c.execute(query).scalars()) == [1, 2, 5]
             query = sa.select(t.c._id).where(sa.and_(sa.not_(like), t.c.n == 2)).order_by(t.c._id)
             assert list(c.execute(query).scalars()) == [2]
+
+
+# ------------------------------------------------------------ paging aggregation pipelines
+
+
+class _AggregateListener(monitoring.CommandListener):
+    """Records aggregate pipelines and how many documents the server returned."""
+
+    def __init__(self):
+        self.pipelines = []
+        self.returned = 0
+
+    def started(self, event):
+        if event.command_name == "aggregate":
+            self.pipelines.append(event.command["pipeline"])
+
+    def succeeded(self, event):
+        if event.command_name in ("aggregate", "getMore"):
+            batch = event.reply.get("cursor", {})
+            self.returned += len(batch.get("firstBatch", batch.get("nextBatch", [])))
+
+    def failed(self, event):
+        pass
+
+
+PAGING_COLLECTION = "test_aggregate_paging"
+PAGING_DOCS = 500
+START = datetime.datetime(2026, 1, 1)
+
+
+@pytest.fixture
+def paging(conn):
+    conn.database.drop_collection(PAGING_COLLECTION)
+    conn.database[PAGING_COLLECTION].insert_many(
+        [{"_id": i, "s": f"k{i:03d}", "v": i, "ts": START + datetime.timedelta(days=i)} for i in range(PAGING_DOCS)]
+    )
+    listener = _AggregateListener()
+    monitored = make_conn(event_listeners=[listener])
+    try:
+        yield monitored, listener
+    finally:
+        monitored.close()
+        conn.database.drop_collection(PAGING_COLLECTION)
+
+
+@pytest.fixture
+def superset_paging(paging):
+    _, listener = paging
+    monitored = make_superset_conn(event_listeners=[listener])
+    try:
+        yield monitored, listener
+    finally:
+        monitored.close()
+
+
+def rows(conn, sql, params=None):
+    return [tuple(r) for r in run(conn, sql, params).fetchall()]
+
+
+class TestLiveAggregatePaging:
+    def test_group_by_limit_offset(self, paging):
+        conn, listener = paging
+        sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT 3 OFFSET 2"
+        assert rows(conn, sql) == [("k002", 1), ("k003", 1), ("k004", 1)]
+        assert listener.pipelines[-1][-2:] == [{"$skip": 2}, {"$limit": 3}]
+        assert listener.returned == 3
+
+    def test_bound_limit_offset(self, paging):
+        conn, listener = paging
+        sql = f"SELECT s, SUM(v) AS t FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT ? OFFSET ?"
+        assert rows(conn, sql, [2, 1]) == [("k001", 1), ("k002", 2)]
+        assert listener.pipelines[-1][-2:] == [{"$skip": 1}, {"$limit": 2}]
+        assert listener.returned == 2
+
+    def test_date_trunc_limit(self, paging):
+        conn, listener = paging
+        sql = f"SELECT DATE_TRUNC('day', ts) AS d, v FROM {PAGING_COLLECTION} ORDER BY v LIMIT 3"
+        assert rows(conn, sql) == [(START + datetime.timedelta(days=i), i) for i in range(3)]
+        assert listener.pipelines[-1][-1] == {"$limit": 3}
+        assert listener.returned == 3
+
+    def test_aggregate_without_group_by(self, paging):
+        conn, listener = paging
+        assert rows(conn, f"SELECT COUNT(*) AS c FROM {PAGING_COLLECTION} LIMIT 1 OFFSET 1") == []
+        assert listener.returned == 0
+
+    def test_limit_zero(self, paging):
+        conn, listener = paging
+        assert rows(conn, f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s LIMIT 0") == []
+        assert listener.returned <= 1
+
+    def test_offset_only(self, paging):
+        conn, listener = paging
+        sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s OFFSET 498"
+        assert rows(conn, sql) == [("k498", 1), ("k499", 1)]
+        assert listener.returned == 2
+
+    def test_no_limit_returns_every_group(self, paging):
+        conn, listener = paging
+        assert len(rows(conn, f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s")) == PAGING_DOCS
+        assert listener.returned == PAGING_DOCS
+
+    def test_aggregate_function_without_where_or_order_by(self, paging):
+        conn, listener = paging
+        sql = f"SELECT * FROM {PAGING_COLLECTION}.aggregate('[{{\"$sort\": {{\"v\": 1}}}}]', '{{}}') LIMIT 2 OFFSET 3"
+        assert [r[0] for r in rows(conn, sql)] == [3, 4]
+        assert listener.returned == 2
+
+    def test_aggregate_function_with_where_still_filters_before_paging(self, paging):
+        conn, _ = paging
+        sql = (
+            f"SELECT * FROM {PAGING_COLLECTION}.aggregate('[{{\"$sort\": {{\"v\": 1}}}}]', '{{}}') "
+            "WHERE v >= 10 LIMIT 2"
+        )
+        assert [r[0] for r in rows(conn, sql)] == [10, 11]
+
+    def test_superset_mode(self, superset_paging):
+        conn, listener = superset_paging
+        sql = f"SELECT s, COUNT(*) AS c FROM {PAGING_COLLECTION} GROUP BY s ORDER BY s LIMIT 3"
+        assert rows(conn, sql) == [("k000", 1), ("k001", 1), ("k002", 1)]
+        assert listener.returned == 3
