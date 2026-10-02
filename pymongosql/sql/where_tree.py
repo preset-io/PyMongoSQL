@@ -155,12 +155,16 @@ def _string_literal(token_text: str) -> str:
 
 
 def _field_path(ctx: Any) -> str:
-    """Dot path for a variable reference or path expression, quotes removed."""
+    """Dot path for a variable reference or path expression, quotes removed.
+
+    A segment starting with ``$`` is rejected, quoted or not: as a filter key it would
+    be a MongoDB operator ("$where" runs JavaScript, "$expr" = 1 matches everything).
+    """
     if isinstance(ctx, (PartiQLParser.VariableIdentifierContext, PartiQLParser.VariableKeywordContext)):
         if getattr(ctx, "qualifier", None) is not None:
             raise NotSupportedError(f"Unsupported variable reference: {ctx.getText()}")
         text = ctx.getText()
-        return text[1:-1].replace('""', '"') if text.startswith('"') else text
+        return _checked_path(text[1:-1].replace('""', '"') if text.startswith('"') else text)
     parts = [_field_path(_unwrap(ctx.getChild(0)))]
     for step in ctx.children[1:]:
         if isinstance(step, PartiQLParser.PathStepDotExprContext):
@@ -176,7 +180,10 @@ def _field_path(ctx: Any) -> str:
                 raise NotSupportedError(f"Unsupported path step: {step.getText()}")
         else:
             raise NotSupportedError(f"Unsupported path step: {step.getText()}")
-    path = ".".join(parts)
+    return _checked_path(".".join(parts))
+
+
+def _checked_path(path: str) -> str:
     # A quoted identifier with dots ("user.name") keeps this driver's nested-path meaning
     if any(not segment or segment.startswith("$") for segment in path.split(".")):
         raise NotSupportedError(f"Unsupported field name: {path!r}")
