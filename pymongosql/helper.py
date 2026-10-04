@@ -153,7 +153,12 @@ class SQLHelper:
                     if not isinstance(part, str):
                         raise ProgrammingError(f"A LIKE pattern parameter must be a string, got {part!r}")
                     parts.append(part)
-                return like_operator("".join(parts), like["escape"], like["i"])
+                escape = like["escape"]
+                if is_param(escape):
+                    escape = take()
+                    if not isinstance(escape, str) or len(escape) != 1:
+                        raise ProgrammingError(f"LIKE ESCAPE must be a single character, got {escape!r}")
+                return like_operator("".join(parts), escape, like["i"])
             if isinstance(val, dict):
                 return {k: replace(v) for k, v in val.items()}
             if isinstance(val, list):
