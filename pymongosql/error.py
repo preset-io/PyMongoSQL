@@ -45,6 +45,10 @@ class ProgrammingError(DatabaseError):
     pass
 
 
+class _LikeProgrammingError(ProgrammingError):
+    """LIKE caller errors that must survive executor exception wrapping."""
+
+
 class IntegrityError(DatabaseError):
     pass
 

@@ -558,7 +558,7 @@ def serializedATN():
         0,0,0,1297,1298,1,0,0,0,1298,1299,5,107,0,0,1299,1320,3,202,101,
         0,1300,1302,10,3,0,0,1301,1303,5,141,0,0,1302,1301,1,0,0,0,1302,
         1303,1,0,0,0,1303,1304,1,0,0,0,1304,1305,5,128,0,0,1305,1308,3,202,
-        101,0,1306,1307,5,75,0,0,1307,1309,3,188,94,0,1308,1306,1,0,0,0,
+        101,0,1306,1307,5,75,0,0,1307,1309,3,202,101,0,1308,1306,1,0,0,0,
         1308,1309,1,0,0,0,1309,1320,1,0,0,0,1310,1312,10,2,0,0,1311,1313,
         5,141,0,0,1312,1311,1,0,0,0,1312,1313,1,0,0,0,1313,1314,1,0,0,0,
         1314,1315,5,17,0,0,1315,1316,3,202,101,0,1316,1317,5,7,0,0,1317,
@@ -11514,7 +11514,7 @@ class PartiQLParser ( Parser ):
             super().__init__(parser)
             self.lhs = None # ExprPredicateContext
             self.rhs = None # MathOp00Context
-            self.escape = None # ExprContext
+            self.escape = None # MathOp00Context
             self.copyFrom(ctx)
 
         def LIKE(self):
@@ -11522,16 +11522,16 @@ class PartiQLParser ( Parser ):
         def exprPredicate(self):
             return self.getTypedRuleContext(PartiQLParser.ExprPredicateContext,0)
 
-        def mathOp00(self):
-            return self.getTypedRuleContext(PartiQLParser.MathOp00Context,0)
+        def mathOp00(self, i:int=None):
+            if i is None:
+                return self.getTypedRuleContexts(PartiQLParser.MathOp00Context)
+            else:
+                return self.getTypedRuleContext(PartiQLParser.MathOp00Context,i)
 
         def NOT(self):
             return self.getToken(PartiQLParser.NOT, 0)
         def ESCAPE(self):
             return self.getToken(PartiQLParser.ESCAPE, 0)
-        def expr(self):
-            return self.getTypedRuleContext(PartiQLParser.ExprContext,0)
-
 
         def enterRule(self, listener:ParseTreeListener):
             if hasattr( listener, "enterPredicateLike" ):
@@ -11694,7 +11694,7 @@ class PartiQLParser ( Parser ):
                             self.state = 1306
                             self.match(PartiQLParser.ESCAPE)
                             self.state = 1307
-                            localctx.escape = self.expr()
+                            localctx.escape = self.mathOp00(0)
 
 
                         pass

@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 
 from bson import Decimal128
 
-from .error import ProgrammingError
+from .error import NotSupportedError, ProgrammingError, _LikeProgrammingError
 
 _logger = logging.getLogger(__name__)
 
@@ -153,7 +153,17 @@ class SQLHelper:
                     if not isinstance(part, str):
                         raise ProgrammingError(f"A LIKE pattern parameter must be a string, got {part!r}")
                     parts.append(part)
-                return like_operator("".join(parts), like["escape"], like["i"])
+                escape = like["escape"]
+                if is_param(escape):
+                    escape = take()
+                    if not isinstance(escape, str) or len(escape) != 1:
+                        raise _LikeProgrammingError(f"LIKE ESCAPE must be a single character, got {escape!r}")
+                try:
+                    return like_operator("".join(parts), escape, like["i"])
+                except NotSupportedError as e:
+                    # Invalid bound LIKE input (e.g. a dangling escape), not a
+                    # server failure. Literal patterns are still checked by parsing.
+                    raise _LikeProgrammingError(str(e)) from e
             if isinstance(val, dict):
                 return {k: replace(v) for k, v in val.items()}
             if isinstance(val, list):

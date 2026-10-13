@@ -571,7 +571,7 @@ exprPredicate
     | lhs=exprPredicate IS NOT? type                                                 # PredicateIs
     | lhs=exprPredicate NOT? IN PAREN_LEFT expr PAREN_RIGHT                          # PredicateIn
     | lhs=exprPredicate NOT? IN rhs=mathOp00                                         # PredicateIn
-    | lhs=exprPredicate NOT? LIKE rhs=mathOp00 ( ESCAPE escape=expr )?               # PredicateLike
+    | lhs=exprPredicate NOT? LIKE rhs=mathOp00 ( ESCAPE escape=mathOp00 )?           # PredicateLike
     | lhs=exprPredicate NOT? BETWEEN lower=mathOp00 AND upper=mathOp00               # PredicateBetween
     | parent_=mathOp00                                                                # PredicateBase
     ;

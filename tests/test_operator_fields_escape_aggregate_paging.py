@@ -3,19 +3,21 @@
 
 - A field name starting with ``$`` is rejected whether or not it is quoted, so
   ``"$where"`` or ``"$expr"`` can never reach MongoDB as a query operator.
-- ``LIKE ... ESCAPE`` keeps SQL precedence for the conditions that follow it: the
-  grammar parses the rest of the boolean chain as the escape expression.
+- ``LIKE ... ESCAPE`` keeps SQL precedence for the conditions that follow it, a long
+  chain of them parses in linear time, and the escape may be a bound parameter.
 - LIMIT and OFFSET of a GROUP BY, aggregate or DATE_TRUNC query become ``$skip`` and
   ``$limit`` stages, so the server returns only the requested page.
 """
 
 import datetime
 import json
+import time
 
 import pytest
 from pymongo import monitoring
 
-from pymongosql.error import Error
+from pymongosql.error import Error, ProgrammingError
+from pymongosql.helper import SQLHelper
 from pymongosql.sql.parser import SQLParser
 from tests.conftest import HAS_SQLALCHEMY, make_conn, make_superset_conn
 
@@ -145,6 +147,107 @@ class TestEscapePrecedence:
             where("n LIKE 'a' ESCAPE b = 1 AND c = 2")
 
 
+def like(i):
+    return f"c{i} LIKE 'a{i}%' ESCAPE '/'"
+
+
+def like_filter(i):
+    return {f"c{i}": {"$regex": f"^a{i}.*"}}
+
+
+class TestEscapeChains:
+    """The escape is one operand, so a chain of escaped LIKEs is parsed in linear time."""
+
+    @pytest.mark.parametrize("count", [50, 200])
+    def test_or_chain_parses_fast_and_flat(self, count):
+        sql = "SELECT _id FROM t WHERE " + " OR ".join(like(i) for i in range(count))
+        started = time.monotonic()
+        filter_stage = plan(sql).filter_stage
+        assert time.monotonic() - started < 5  # 15 predicates took ~11 s before
+        assert filter_stage == {"$or": [like_filter(i) for i in range(count)]}
+
+    @pytest.mark.parametrize("count", [50, 200])
+    def test_and_chain_parses_fast_and_flat(self, count):
+        sql = "SELECT _id FROM t WHERE " + " AND ".join(like(i) for i in range(count))
+        started = time.monotonic()
+        filter_stage = plan(sql).filter_stage
+        assert time.monotonic() - started < 5
+        assert filter_stage == {"$and": [like_filter(i) for i in range(count)]}
+
+    def test_mixed_chain_keeps_precedence(self):
+        # (c0 LIKE AND n = 0) OR (c1 LIKE AND n = 1) OR ... : AND binds tighter than OR
+        count = 60
+        sql = "SELECT _id FROM t WHERE " + " OR ".join(f"{like(i)} AND n = {i}" for i in range(count))
+        started = time.monotonic()
+        filter_stage = plan(sql).filter_stage
+        assert time.monotonic() - started < 5
+        assert filter_stage == {"$or": [{"$and": [like_filter(i), {"n": i}]} for i in range(count)]}
+
+    def test_not_and_parentheses_inside_a_long_chain(self):
+        parts = [like(i) for i in range(50)]
+        parts[10] = f"NOT {parts[10]}"
+        parts[20] = f"({parts[20]} AND n = 1)"
+        filter_stage = plan("SELECT _id FROM t WHERE " + " OR ".join(parts)).filter_stage
+        branches = filter_stage["$or"]
+        assert len(branches) == 50
+        assert branches[10] == {"$and": [{"c10": {"$not": {"$regex": "^a10.*"}}}, {"c10": {"$ne": None}}]}
+        assert branches[20] == {"$and": [like_filter(20), {"n": 1}]}
+        assert branches[0] == like_filter(0) and branches[49] == like_filter(49)
+
+    def test_chain_between_other_predicates(self):
+        sql = "SELECT _id FROM t WHERE n = 1 AND " + " AND ".join(like(i) for i in range(3)) + " OR n = 2"
+        assert plan(sql).filter_stage == {
+            "$or": [{"$and": [{"n": 1}, like_filter(0), like_filter(1), like_filter(2)]}, {"n": 2}]
+        }
+
+
+class TestBoundEscape:
+    @staticmethod
+    def bind(sql_where, params):
+        filter_stage = where(sql_where)
+        return SQLHelper.bind_filter(filter_stage, params)[0]
+
+    def test_bound_pattern_and_escape(self):
+        assert self.bind("name LIKE ? ESCAPE ?", ["a/%b%", "/"]) == {"name": {"$regex": "^a%b.*"}}
+
+    @pytest.mark.parametrize("pattern,escape,regex", [("a\\%b", "\\", "^a%b$"), ("a.b", ".", "^ab$")])
+    def test_bound_regex_metacharacter_escape(self, pattern, escape, regex):
+        assert self.bind("name LIKE ? ESCAPE ?", [pattern, escape]) == {"name": {"$regex": regex}}
+
+    @pytest.mark.parametrize(
+        "sql_where,params", [("name LIKE ? ESCAPE ?", ["ab!", "!"]), ("name LIKE ? ESCAPE '!'", ["ab!"])]
+    )
+    def test_bound_pattern_with_dangling_escape(self, sql_where, params):
+        with pytest.raises(ProgrammingError, match="LIKE pattern ends with its escape character"):
+            self.bind(sql_where, params)
+
+    def test_bound_escape_with_literal_pattern(self):
+        assert self.bind("name LIKE 'a/_b' ESCAPE ?", ["/"]) == {"name": {"$regex": "^a_b$"}}
+
+    def test_not_and_ilike_keep_their_meaning(self):
+        assert self.bind("NOT name LIKE ? ESCAPE ?", ["a/%", "/"]) == {
+            "$and": [{"name": {"$not": {"$regex": "^a%$"}}}, {"name": {"$ne": None}}]
+        }
+        assert self.bind("lower(name) LIKE ? ESCAPE ?", ["a/%", "/"]) == {"name": {"$regex": "^a%$", "$options": "i"}}
+
+    def test_parameters_bind_in_textual_order(self):
+        bound = self.bind("n = ? AND name LIKE ? ESCAPE ? OR c = ?", [1, "x#%", "#", 2])
+        assert bound == {"$or": [{"$and": [{"n": 1}, {"name": {"$regex": "^x%$"}}]}, {"c": 2}]}
+
+    @pytest.mark.parametrize("escape", ["ab", "", 1, None, b"/", ["/"], {"$pymongosqlParam": True}])
+    def test_escape_must_be_one_character_when_bound(self, escape):
+        with pytest.raises(ProgrammingError, match="LIKE ESCAPE must be a single character"):
+            self.bind("name LIKE ? ESCAPE ?", ["a", escape])
+
+    def test_missing_escape_parameter(self):
+        with pytest.raises(ProgrammingError, match="Not enough parameters"):
+            self.bind("name LIKE ? ESCAPE ?", ["a"])
+
+    def test_literal_escape_is_still_checked_at_parse_time(self):
+        with pytest.raises(Error, match="single character"):
+            where("name LIKE ? ESCAPE 'ab'")
+
+
 ESCAPE_COLLECTION = "test_escape_precedence"
 ESCAPE_DOCS = [
     {"_id": 1, "n": 1, "name": "zz_a"},
@@ -189,6 +292,42 @@ class TestLiveEscapePrecedence:
 
     def test_parameters_bind_in_order(self, escape_docs):
         assert ids(escape_docs, "n = ? AND name LIKE ? ESCAPE '/' OR n = ?", [1, "zz%", 2]) == [1, 2, 5]
+
+    def test_bound_escape(self, escape_docs):
+        assert ids(escape_docs, "name LIKE ? ESCAPE ?", ["zz/%%", "/"]) == [3]
+        assert ids(escape_docs, "name LIKE ? ESCAPE ?", ["zz#_%", "#"]) == [1]
+        assert ids(escape_docs, "n = ? AND name LIKE ? ESCAPE ? OR n = ?", [1, "zz%", "/", 2]) == [1, 2, 5]
+        assert ids(escape_docs, "NOT name LIKE ? ESCAPE ? AND n = ?", ["zz%", "/", 2]) == [2]
+
+    def test_bound_multi_character_escape_fails_at_execution(self, escape_docs):
+        with pytest.raises(ProgrammingError, match="LIKE ESCAPE must be a single character, got '//'"):
+            ids(escape_docs, "name LIKE ? ESCAPE ?", ["zz%", "//"])
+
+    @pytest.mark.parametrize("mode", ["standard", "superset"])
+    @pytest.mark.parametrize("statement", ["SELECT _id FROM", "SELECT COUNT(*) AS c FROM", "DELETE FROM", "UPDATE"])
+    @pytest.mark.parametrize(
+        "predicate,params,message",
+        [
+            ("name LIKE ? ESCAPE ?", ["a%", None], "LIKE ESCAPE must be a single character"),
+            ("name LIKE ? ESCAPE ?", ["ab!", "!"], "LIKE pattern ends with its escape character"),
+            ("name LIKE ? ESCAPE '!'", ["ab!"], "LIKE pattern ends with its escape character"),
+        ],
+    )
+    def test_invalid_bound_like_is_programming_error(self, escape_docs, mode, statement, predicate, params, message):
+        connection = make_superset_conn() if mode == "superset" else make_conn()
+        assignment = " SET n = 0" if statement == "UPDATE" else ""
+        try:
+            with pytest.raises(ProgrammingError, match=message):
+                run(connection, f"{statement} {ESCAPE_COLLECTION}{assignment} WHERE {predicate}", params)
+            stored = list(escape_docs.database[ESCAPE_COLLECTION].find({}, sort=[("_id", 1)]))
+            assert stored == ESCAPE_DOCS
+        finally:
+            connection.close()
+
+    def test_long_chain(self, escape_docs):
+        likes = " OR ".join(f"name LIKE 'nomatch{i}%' ESCAPE '/'" for i in range(60))
+        assert ids(escape_docs, f"{likes} OR n = 4") == [4]
+        assert ids(escape_docs, f"n = 2 AND name LIKE 'zz%' ESCAPE '/' OR {likes}") == [5]
 
     def test_having(self, escape_docs):
         rows = run(
