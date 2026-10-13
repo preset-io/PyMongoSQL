@@ -7,7 +7,7 @@ from typing import Any, Dict, Optional, Sequence, Union
 
 from pymongo.errors import PyMongoError
 
-from .error import DatabaseError, OperationalError, ProgrammingError, SqlSyntaxError
+from .error import DatabaseError, OperationalError, ProgrammingError, SqlSyntaxError, _LikeProgrammingError
 from .helper import SQLHelper
 from .retry import execute_with_retry
 from .sql.delete_builder import DeleteExecutionPlan
@@ -203,6 +203,9 @@ class StandardQueryExecution(ExecutionStrategy):
             # Create command result
             return result
 
+        except _LikeProgrammingError:
+            # Preserve LIKE/ESCAPE caller errors without changing other wrapping.
+            raise
         except PyMongoError as e:
             _logger.error(f"MongoDB command execution failed: {e}")
             raise DatabaseError(f"Command execution failed: {e}")

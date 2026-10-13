@@ -210,6 +210,17 @@ class TestBoundEscape:
     def test_bound_pattern_and_escape(self):
         assert self.bind("name LIKE ? ESCAPE ?", ["a/%b%", "/"]) == {"name": {"$regex": "^a%b.*"}}
 
+    @pytest.mark.parametrize("pattern,escape,regex", [("a\\%b", "\\", "^a%b$"), ("a.b", ".", "^ab$")])
+    def test_bound_regex_metacharacter_escape(self, pattern, escape, regex):
+        assert self.bind("name LIKE ? ESCAPE ?", [pattern, escape]) == {"name": {"$regex": regex}}
+
+    @pytest.mark.parametrize(
+        "sql_where,params", [("name LIKE ? ESCAPE ?", ["ab!", "!"]), ("name LIKE ? ESCAPE '!'", ["ab!"])]
+    )
+    def test_bound_pattern_with_dangling_escape(self, sql_where, params):
+        with pytest.raises(ProgrammingError, match="LIKE pattern ends with its escape character"):
+            self.bind(sql_where, params)
+
     def test_bound_escape_with_literal_pattern(self):
         assert self.bind("name LIKE 'a/_b' ESCAPE ?", ["/"]) == {"name": {"$regex": "^a_b$"}}
 
@@ -223,7 +234,7 @@ class TestBoundEscape:
         bound = self.bind("n = ? AND name LIKE ? ESCAPE ? OR c = ?", [1, "x#%", "#", 2])
         assert bound == {"$or": [{"$and": [{"n": 1}, {"name": {"$regex": "^x%$"}}]}, {"c": 2}]}
 
-    @pytest.mark.parametrize("escape", ["ab", "", 1, None])
+    @pytest.mark.parametrize("escape", ["ab", "", 1, None, b"/", ["/"], {"$pymongosqlParam": True}])
     def test_escape_must_be_one_character_when_bound(self, escape):
         with pytest.raises(ProgrammingError, match="LIKE ESCAPE must be a single character"):
             self.bind("name LIKE ? ESCAPE ?", ["a", escape])
@@ -289,8 +300,29 @@ class TestLiveEscapePrecedence:
         assert ids(escape_docs, "NOT name LIKE ? ESCAPE ? AND n = ?", ["zz%", "/", 2]) == [2]
 
     def test_bound_multi_character_escape_fails_at_execution(self, escape_docs):
-        with pytest.raises(Error, match="LIKE ESCAPE must be a single character, got '//'"):
+        with pytest.raises(ProgrammingError, match="LIKE ESCAPE must be a single character, got '//'"):
             ids(escape_docs, "name LIKE ? ESCAPE ?", ["zz%", "//"])
+
+    @pytest.mark.parametrize("mode", ["standard", "superset"])
+    @pytest.mark.parametrize("statement", ["SELECT _id FROM", "SELECT COUNT(*) AS c FROM", "DELETE FROM", "UPDATE"])
+    @pytest.mark.parametrize(
+        "predicate,params,message",
+        [
+            ("name LIKE ? ESCAPE ?", ["a%", None], "LIKE ESCAPE must be a single character"),
+            ("name LIKE ? ESCAPE ?", ["ab!", "!"], "LIKE pattern ends with its escape character"),
+            ("name LIKE ? ESCAPE '!'", ["ab!"], "LIKE pattern ends with its escape character"),
+        ],
+    )
+    def test_invalid_bound_like_is_programming_error(self, escape_docs, mode, statement, predicate, params, message):
+        connection = make_superset_conn() if mode == "superset" else make_conn()
+        assignment = " SET n = 0" if statement == "UPDATE" else ""
+        try:
+            with pytest.raises(ProgrammingError, match=message):
+                run(connection, f"{statement} {ESCAPE_COLLECTION}{assignment} WHERE {predicate}", params)
+            stored = list(escape_docs.database[ESCAPE_COLLECTION].find({}, sort=[("_id", 1)]))
+            assert stored == ESCAPE_DOCS
+        finally:
+            connection.close()
 
     def test_long_chain(self, escape_docs):
         likes = " OR ".join(f"name LIKE 'nomatch{i}%' ESCAPE '/'" for i in range(60))
