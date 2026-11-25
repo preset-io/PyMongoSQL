@@ -74,6 +74,10 @@ class Connection:
         # Extract commonly used parameters for backward compatibility
         self._host = host or "localhost"
         self._port = port or 27017
+        # Credential-free host description and the secrets to scrub from error messages.
+        # The raw URI holds the password, so it must never reach a log or exception.
+        self._display_host = ConnectionHelper.describe_host(self._host, self._port)
+        self._secrets = ConnectionHelper.collect_secrets([connection_string, host], kwargs)
 
         # Handle database parameter separately (not a MongoClient parameter)
         # Explicit 'database' parameter takes precedence over database in URI
@@ -117,7 +121,13 @@ class Connection:
             self._connect()
         else:
             # Just create the client without testing connection
-            self._client = MongoClient(**self._pymongo_params)
+            try:
+                self._client = MongoClient(**self._pymongo_params)
+            except Exception as e:
+                message = self._scrub(e)
+                if message == str(e):
+                    raise
+                raise DatabaseError(f"Database connection error: {message}") from None
             # Initialize the database according to explicit parameter or client's default
             self._init_database()
 
@@ -139,17 +149,32 @@ class Connection:
             # This may raise OperationalError if no database could be determined; allow it to bubble up
             self._init_database()
 
-            _logger.info(f"Successfully connected to MongoDB at {self._host}:{self._port}")
+            _logger.info(
+                "Successfully connected to MongoDB at %s (database: %s)", self._display_host, self._database_name
+            )
 
         except OperationalError:
             # Allow OperationalError (e.g., no database selected) to propagate unchanged
             raise
         except ConnectionFailure as e:
-            _logger.error(f"Failed to connect to MongoDB: {e}")
-            raise OperationalError(f"Could not connect to MongoDB: {e}")
+            message = self._scrub(e)
+            _logger.error("Failed to connect to MongoDB: %s", message)
+            error = OperationalError(f"Could not connect to MongoDB: {message}")
+            # Drop the original exception from the traceback if its message held a secret.
+            if message != str(e):
+                raise error from None
+            raise error
         except Exception as e:
-            _logger.error(f"Unexpected error during connection: {e}")
-            raise DatabaseError(f"Database connection error: {e}")
+            message = self._scrub(e)
+            _logger.error("Unexpected error during connection: %s", message)
+            error = DatabaseError(f"Database connection error: {message}")
+            if message != str(e):
+                raise error from None
+            raise error
+
+    def _scrub(self, error: Any) -> str:
+        """Return ``str(error)`` with this connection's credentials removed."""
+        return ConnectionHelper.scrub(error, self._secrets)
 
     def _init_database(self) -> None:
         """Internal helper to initialize `self._database`.
@@ -246,27 +271,17 @@ class Connection:
 
     @property
     def host(self) -> str:
-        """Get the MongoDB connection string/URL used by PyMongo"""
-        if self._client is None:
-            # If not connected yet, construct basic connection string
-            if isinstance(self._host, str):
-                return f"mongodb://{self._host}:{self._port}"
-            elif isinstance(self._host, list):
-                hosts = [f"{h}:{self._port}" if ":" not in str(h) else str(h) for h in self._host]
-                return f"mongodb://{','.join(hosts)}"
-            else:
-                return f"mongodb://localhost:{self._port}"
-        else:
-            # Return the actual connection string from PyMongo client
-            # PyMongo stores the connection info in the client
-            nodes = self._client.nodes
-            if nodes:
-                # Get primary node or first available node
-                node = next(iter(nodes))
-                return f"mongodb://{node[0]}:{node[1]}"
-            else:
-                # Fallback to original host/port
-                return f"mongodb://{self._host}:{self._port}"
+        """Get the MongoDB host URL, without credentials"""
+        # PyMongo stores the connected nodes in the client
+        nodes = self._client.nodes if self._client is not None else None
+        if nodes:
+            # Get primary node or first available node
+            node = next(iter(nodes))
+            return f"mongodb://{node[0]}:{node[1]}"
+        # Not connected yet: describe the configured host(s)
+        if "://" in self._display_host:
+            return self._display_host
+        return f"mongodb://{self._display_host}"
 
     @property
     def port(self) -> int:
@@ -312,7 +327,10 @@ class Connection:
     def __str__(self) -> str:
         """String representation of the connection"""
         status = "connected" if self.is_connected else "disconnected"
-        return f"Connection(host={self._host}, port={self._port}, database={self._database_name}, status={status})"
+        return (
+            f"Connection(host={self._display_host}, port={self._port}, "
+            f"database={self._database_name}, status={status})"
+        )
 
     def cursor(self, cursor: Optional[Type[BaseCursor]] = None, **kwargs) -> BaseCursor:
         kwargs.update(self.cursor_kwargs)
