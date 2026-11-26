@@ -6,15 +6,29 @@ Handles connection string parsing and mode detection.
 """
 
 import logging
+import re
 from decimal import Decimal
-from typing import Any, Optional, Sequence, Tuple
-from urllib.parse import parse_qs, urlparse
+from typing import Any, Iterable, List, Optional, Sequence, Tuple
+from urllib.parse import parse_qs, quote, quote_plus, unquote, unquote_plus, urlparse
 
 from bson import Decimal128
 
 from .error import NotSupportedError, ProgrammingError, _LikeProgrammingError
 
 _logger = logging.getLogger(__name__)
+
+REDACTED = "***"
+
+# scheme://userinfo@ inside free text. The userinfo runs to the last "@" of the
+# token, as pymongo splits it, so an unescaped "@" in a password is still covered.
+_URI_USERINFO_RE = re.compile(r"(?P<scheme>\b[A-Za-z][A-Za-z0-9+.\-]*://)(?P<userinfo>\S*)@")
+# A bare "secret@host" fragment, e.g. pymongo's 'Bad database name "ss@host/db"'
+# when a password holds an unescaped "/".
+_USERINFO_FRAGMENT_RE = re.compile(r"[^\s\"'/:@]+@")
+# Keyword arguments MongoClient accepts that carry a secret.
+_SECRET_KWARGS = ("password", "tlsCertificateKeyFilePassword")
+# URI options that carry a secret.
+_SECRET_OPTION_RE = re.compile(r"(?i)(?:tlsCertificateKeyFilePassword|authMechanismProperties)=([^&]*)")
 
 
 class ConnectionHelper:
@@ -65,9 +79,14 @@ class ConnectionHelper:
 
             # Extract database name from path
             database_name = None
-            if parsed.path:
+            path = parsed.path
+            if "@" in path:
+                # An unescaped "/" in the credentials: the real path starts after the last "@".
+                location = path.rpartition("@")[2]
+                path = location[location.find("/") :] if "/" in location else ""
+            if path:
                 # Remove leading slash and trailing slashes
-                path_parts = parsed.path.strip("/").split("/")
+                path_parts = path.strip("/").split("/")
                 if path_parts and path_parts[0]:  # Get the first path segment as database name
                     database_name = path_parts[0]
 
@@ -100,6 +119,80 @@ class ConnectionHelper:
         except Exception as e:
             _logger.error(f"Failed to parse connection string: {e}")
             raise ValueError(f"Invalid connection string format: {e}")
+
+    @staticmethod
+    def describe_host(host: Optional[Any], port: int) -> str:
+        """Describe the MongoDB host(s) for logs and repr, without credentials or URI options.
+
+        ``mongodb+srv://user:secret@cluster.example.net/db?tls=true`` becomes
+        ``mongodb+srv://cluster.example.net/db``; a bare host gets the port appended.
+        """
+        hosts = host if isinstance(host, (list, tuple)) else [host or "localhost"]
+        return ",".join(ConnectionHelper._describe_one(str(h), port) for h in hosts)
+
+    @staticmethod
+    def _describe_one(host: str, port: int) -> str:
+        scheme, sep, rest = host.partition("://")
+        if not sep:
+            address = host.rpartition("@")[2]
+            if ":" not in address or address.endswith("]"):
+                address = f"{address}:{port}"
+            return address
+        # Options start at the first "?" (as in pymongo). Credentials end at the last "@"
+        # before them, so an unescaped "/" or "@" in a password is dropped too.
+        location = rest.partition("?")[0].rpartition("@")[2]
+        return f"{scheme}://{location}"
+
+    @staticmethod
+    def collect_secrets(host: Optional[Any], options: Optional[dict] = None) -> List[str]:
+        """Return the secrets in a host URI (or list of them) and MongoClient keyword arguments.
+
+        Each secret is returned raw and in its percent-encoded and decoded forms, longest
+        first, so ``scrub`` can remove it from an error message in whatever form it appears.
+        """
+        values: List[str] = []
+        hosts = host if isinstance(host, (list, tuple)) else [host]
+        for item in hosts:
+            if not isinstance(item, str):
+                continue
+            scheme_free = item.partition("://")[2] or item
+            userinfo = scheme_free.rpartition("@")[0]
+            password = userinfo.partition(":")[2]
+            if password:
+                values.append(password)
+                # pymongo splits an unescaped "/", "?" or "#" out of a password and may echo
+                # a piece of it, e.g. as the port of host "user:<piece>".
+                values.extend(re.split(r"[/?#]", password))
+            values.extend(_SECRET_OPTION_RE.findall(item))
+        for key in _SECRET_KWARGS:
+            value = (options or {}).get(key)
+            if isinstance(value, str):
+                values.append(value)
+
+        forms = set()
+        for value in values:
+            forms.update((value, unquote(value), unquote_plus(value), quote(value, safe=""), quote_plus(value)))
+        forms.discard("")
+        return sorted(forms, key=len, reverse=True)
+
+    @staticmethod
+    def redact_uri(text: str) -> str:
+        """Mask the password of every ``scheme://user:password@`` URI in ``text``."""
+
+        def mask(match: "re.Match[str]") -> str:
+            user, sep, _ = match.group("userinfo").partition(":")
+            return f"{match.group('scheme')}{user}:{REDACTED}@" if sep else match.group(0)
+
+        return _URI_USERINFO_RE.sub(mask, text)
+
+    @staticmethod
+    def scrub(text: Any, secrets: Iterable[str] = ()) -> str:
+        """Remove credentials from a message (e.g. a pymongo error) before it is logged or raised."""
+        text = str(text)
+        for secret in secrets:
+            text = text.replace(secret, REDACTED)
+        text = ConnectionHelper.redact_uri(text)
+        return _USERINFO_FRAGMENT_RE.sub(f"{REDACTED}@", text)
 
 
 class SQLHelper:
