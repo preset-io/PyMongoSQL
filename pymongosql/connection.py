@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 import logging
 from importlib.metadata import version as _get_version
-from typing import Any, Optional, Sequence, Type, Union
+from typing import Any, NoReturn, Optional, Sequence, Type, Union
 
 from bson.codec_options import TypeRegistry
 from pymongo import MongoClient
@@ -159,22 +159,25 @@ class Connection:
         except ConnectionFailure as e:
             message = self._scrub(e)
             _logger.error("Failed to connect to MongoDB: %s", message)
-            error = OperationalError(f"Could not connect to MongoDB: {message}")
-            # Drop the original exception from the traceback if its message held a secret.
-            if message != str(e):
-                raise error from None
-            raise error
+            self._raise_scrubbed(OperationalError(f"Could not connect to MongoDB: {message}"), e, message)
         except Exception as e:
             message = self._scrub(e)
             _logger.error("Unexpected error during connection: %s", message)
-            error = DatabaseError(f"Database connection error: {message}")
-            if message != str(e):
-                raise error from None
-            raise error
+            self._raise_scrubbed(DatabaseError(f"Database connection error: {message}"), e, message)
 
     def _scrub(self, error: Any) -> str:
         """Return ``str(error)`` with this connection's credentials removed."""
         return ConnectionHelper.scrub(error, self._secrets)
+
+    @staticmethod
+    def _raise_scrubbed(error: Exception, original: Exception, message: str) -> NoReturn:
+        """Raise ``error`` chained to ``original``, unless scrubbing changed the message.
+
+        A chained original would print the unscrubbed message (and the secret) in tracebacks.
+        """
+        if message != str(original):
+            raise error from None
+        raise error from original
 
     def _init_database(self) -> None:
         """Internal helper to initialize `self._database`.
